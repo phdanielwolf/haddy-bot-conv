@@ -9,8 +9,7 @@ export class GptVisionService {
   private readonly logger = new Logger(GptVisionService.name);
 
   constructor(private readonly configService: ConfigService) {
-    const apiKey =
-      this.configService.get('OPENAI_API_KEY_VISION')
+    const apiKey = this.configService.get('OPENAI_API_KEY_VISION');
     this.openai = new OpenAI({ apiKey });
   }
 

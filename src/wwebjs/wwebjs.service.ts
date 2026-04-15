@@ -48,6 +48,7 @@ export class WwebjsService implements OnModuleInit {
   private lastHeartbeat = 0;
   private heartbeatFailures = 0;
   private maxHeartbeatFailures = 3;
+  private readonly allowedResponderNumber = '5493835404743';
 
   constructor(
     private readonly botService: BotSynergysService,
@@ -306,8 +307,11 @@ export class WwebjsService implements OnModuleInit {
         return;
       }
 
+      if (!this.isAuthorizedChatId(message.from)) {
+        return;
+      }
+
       console.log('📨 Mensaje recibido de:', message.from);
-      
 
       const messageContent = message.body || 'Mensaje multimedia';
 
@@ -316,15 +320,11 @@ export class WwebjsService implements OnModuleInit {
         return;
       }
 
-      
-
       console.log('✅ Procesando mensaje:', {
         from: message.from,
         isGroup: message.from.includes('@g.us'),
         content: messageContent.substring(0, 50) + '...',
       });
-
-      return;
 
       if (message.from.includes('@g.us')) {
         await this.handleGroupMessage(message, messageContent);
@@ -342,7 +342,7 @@ export class WwebjsService implements OnModuleInit {
       '120363422110552517@g.us', // Grupo original
       '120363418511991684@g.us', // Descomenta y agrega el nuevo ID aquí
     ];
-    
+
     const isCorrectGroup = allowedGroups.includes(message.from);
     // Verificar menciones
     const mentions = message.mentionedIds || [];
@@ -396,6 +396,10 @@ export class WwebjsService implements OnModuleInit {
     const sender = message.from;
 
     try {
+      if (!this.isAuthorizedChatId(sender)) {
+        return;
+      }
+
       const saved = await this.saveMessage(message, messageContent);
 
       // Verificar si es una imagen
@@ -411,15 +415,7 @@ export class WwebjsService implements OnModuleInit {
       ) {
         // Normalizar el número para verificar (eliminar @c.us si existe)
         const cleanSender = sender.replace('@c.us', '').replace(' ', '');
-        if (
-          cleanSender === '5493835404743' ||
-          cleanSender === '5491169705614' ||
-          cleanSender === '5492994272418' ||
-          cleanSender === '5492995970717' ||
-          cleanSender === '5491160508181' ||
-          cleanSender === '5492995712686' ||
-          cleanSender === '5493462635235'
-        ) {
+        if (cleanSender === this.allowedResponderNumber) {
           await this.handleAudioMessage(message, sender);
           return;
         }
@@ -862,6 +858,10 @@ export class WwebjsService implements OnModuleInit {
 
   async sendMessage(messageDto: MessageVDto): Promise<string> {
     try {
+      /* if (!this.isAuthorizedChatId(messageDto.messageTo)) {
+        return 'Destinatario no autorizado';
+      } */
+
       if (!this.isConnectionReady()) {
         console.log(
           '⚠️ Conexión no disponible, agregando mensaje a la cola...',
@@ -909,6 +909,10 @@ export class WwebjsService implements OnModuleInit {
   // === Envío de imágenes ===
   async sendImage(dto: SendImageDto): Promise<string> {
     try {
+      if (!this.isAuthorizedChatId(dto.messageTo)) {
+        return 'Destinatario no autorizado';
+      }
+
       if (!this.isConnectionReady()) {
         throw new Error('Cliente no conectado');
       }
@@ -950,6 +954,16 @@ export class WwebjsService implements OnModuleInit {
 
     // Base64 puro, usar por defecto PNG
     return { mime: 'image/png', data: input };
+  }
+
+  private isAuthorizedChatId(chatId: string): boolean {
+    if (!chatId) {
+      return false;
+    }
+
+    const base = chatId.includes('@') ? chatId.split('@')[0] : chatId;
+    const digits = base.replace(/\D/g, '');
+    return digits === this.allowedResponderNumber;
   }
 
   private isConnectionReady(): boolean {

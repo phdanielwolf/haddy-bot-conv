@@ -5,8 +5,7 @@ import * as path from 'path';
 import * as os from 'os';
 
 const openai = new OpenAI({
-  apiKey:
-    process.env.OPENAI_API_KEY
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
 type ChatMessage = {
