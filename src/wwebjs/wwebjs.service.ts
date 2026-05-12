@@ -11,6 +11,8 @@ import {
   writeFileSync,
   createWriteStream,
   unlinkSync,
+  readdirSync,
+  statSync,
 } from 'fs';
 import { join } from 'path';
 import PDFDocument = require('pdfkit');
@@ -71,6 +73,34 @@ export class WwebjsService implements OnModuleInit {
     }
   }
 
+  private cleanChromeLocks(dir: string) {
+    try {
+      if (!existsSync(dir)) return;
+      const entries = readdirSync(dir);
+      for (const entry of entries) {
+        const full = join(dir, entry);
+        if (entry.startsWith('Singleton')) {
+          try {
+            unlinkSync(full);
+            console.log(`🧹 Lock eliminado: ${full}`);
+          } catch (e) {
+            console.error(`⚠️ No se pudo eliminar ${full}:`, e.message);
+          }
+          continue;
+        }
+        try {
+          if (statSync(full).isDirectory()) {
+            this.cleanChromeLocks(full);
+          }
+        } catch {
+          // Ignorar errores de stat (symlinks rotos, etc.)
+        }
+      }
+    } catch (error) {
+      console.error('⚠️ Error limpiando locks de Chrome:', error);
+    }
+  }
+
   private async initializeWWebJS() {
     try {
       // Crear directorio para sesión si no existe
@@ -78,6 +108,9 @@ export class WwebjsService implements OnModuleInit {
       if (!existsSync(sessionDir)) {
         mkdirSync(sessionDir, { recursive: true });
       }
+
+      // Limpiar locks de Chrome de crashes anteriores
+      this.cleanChromeLocks(sessionDir);
 
       // Configurar cliente con opciones optimizadas
       this.client = new Client({
