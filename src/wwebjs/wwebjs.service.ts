@@ -84,12 +84,9 @@ export class WwebjsService implements OnModuleInit {
         authStrategy: new (require('whatsapp-web.js').LocalAuth)({
           dataPath: sessionDir,
         }),
-        // Forzar versión fresca para evitar bucle de autenticación
-        webVersionCache: {
-          type: 'none',
-        },
         puppeteer: {
           headless: true,
+          protocolTimeout: 120000,
           args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -97,7 +94,12 @@ export class WwebjsService implements OnModuleInit {
             '--disable-accelerated-2d-canvas',
             '--no-first-run',
             '--no-zygote',
+            '--single-process',
             '--disable-gpu',
+            '--disable-extensions',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
             // Usar un User-Agent moderno para evitar bloqueos
             '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
           ],
