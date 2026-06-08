@@ -964,9 +964,34 @@ export class WwebjsService implements OnModuleInit {
       );
     }
 
+    // Resolver el número REAL del remitente. WhatsApp ahora puede entregar el
+    // remitente como un LID (@lid) en lugar del número (@c.us). whatsapp-web.js
+    // mapea LID→teléfono, así que `contact.number` devuelve el número real aunque
+    // `message.from` sea un @lid. Preferimos un jid canónico `{numero}@c.us` para
+    // que Laravel matchee con el cliente y no se dupliquen contactos; el LID
+    // queda SÓLO como último recurso si no se pudo obtener el número.
+    let jid = message.from;
+    let telefono = (message.from.split('@')[0] || '').replace(/\D/g, '');
+    let nombreWa = (message as any)?._data?.notifyName || undefined;
+    try {
+      const contact: any = await message.getContact();
+      const realNumber = (contact?.number || '').toString().replace(/\D/g, '');
+      if (realNumber) {
+        telefono = realNumber;
+        jid = `${realNumber}@c.us`;
+      }
+      nombreWa = contact?.pushname || contact?.name || nombreWa;
+    } catch (e) {
+      console.warn(
+        '⚠️ No se pudo resolver el contacto (LID→teléfono):',
+        (e as any)?.message || e,
+      );
+    }
+
     const payload = {
-      jid: message.from,
-      nombre_wa: (message as any)?._data?.notifyName || undefined,
+      jid,
+      telefono,
+      nombre_wa: nombreWa,
       wa_uid: message.id?._serialized,
       direction: 'in',
       tipo,
