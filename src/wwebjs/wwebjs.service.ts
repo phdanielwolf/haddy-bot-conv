@@ -23,6 +23,7 @@ import { GoogleDriveService } from 'src/google-drive/google-drive.service';
 import { DropboxService } from 'src/dropbox/dropbox.service';
 import { OpenAiService } from 'src/ia/openai.service';
 import { remove as removeAccents } from 'diacritics';
+import axios from 'axios';
 
 interface QueuedMessage {
   messageDto: MessageVDto;
@@ -103,8 +104,10 @@ export class WwebjsService implements OnModuleInit {
 
   private async initializeWWebJS() {
     try {
-      // Crear directorio para sesión si no existe
-      const sessionDir = '/data/wwebjs_auth';
+      // Crear directorio para sesión si no existe.
+      // Configurable por env: en producción/Railway = '/data/wwebjs_auth'
+      // (volumen persistente); en local podés usar p.ej. './wwebjs_auth'.
+      const sessionDir = process.env.WWEBJS_SESSION_DIR || '/data/wwebjs_auth';
       if (!existsSync(sessionDir)) {
         mkdirSync(sessionDir, { recursive: true });
       }
@@ -126,8 +129,12 @@ export class WwebjsService implements OnModuleInit {
             '--disable-dev-shm-usage',
             '--disable-accelerated-2d-canvas',
             '--no-first-run',
-            '--no-zygote',
-            '--single-process',
+            // ⚠️ '--single-process' y '--no-zygote' ahorran RAM en contenedores
+            // Linux (Railway) pero CRASHEAN Chrome en Windows ("Navigating frame
+            // was detached"). Por eso se aplican sólo fuera de Windows.
+            ...(process.platform === 'win32'
+              ? []
+              : ['--no-zygote', '--single-process']),
             '--disable-gpu',
             '--disable-extensions',
             '--disable-background-timer-throttling',
@@ -236,6 +243,14 @@ export class WwebjsService implements OnModuleInit {
       await this.handleIncomingMessage(message);
     });
 
+    // 📡 Acks de entrega/lectura de los mensajes que ENVIAMOS (salientes).
+    // ack: -1 error, 0 pending, 1 server(✓), 2 device(✓✓), 3 read(✓✓ azul), 4 played.
+    this.client.on('message_ack', (message, ack) => {
+      this.forwardAckToLaravel(message, ack).catch((e) =>
+        console.error('⚠️ Error reenviando ack a Laravel:', e?.message || e),
+      );
+    });
+
     // Evento de cambio de estado
     this.client.on('change_state', (state) => {
       console.log('🔄 Cambio de estado:', state);
@@ -340,6 +355,18 @@ export class WwebjsService implements OnModuleInit {
       // Ignorar mensajes propios y de estado
       if (message.fromMe || message.from === 'status@broadcast') {
         return;
+      }
+
+      // 🔁 Reenviar SIEMPRE el mensaje a Laravel (independiente del filtro del
+      // bot) para que el estudio contable vea lo que escriben TODOS los
+      // clientes. Fire-and-forget: no bloquea ni rompe el flujo del bot.
+      if (!message.from.includes('@g.us')) {
+        this.forwardToLaravel(message).catch((e) =>
+          console.error(
+            '⚠️ Error reenviando mensaje a Laravel:',
+            e?.message || e,
+          ),
+        );
       }
 
       if (!this.isAuthorizedChatId(message.from)) {
@@ -879,6 +906,116 @@ export class WwebjsService implements OnModuleInit {
     return sinAcentos.replace(/[^a-zA-Z0-9_-]/g, '_');
   }
 
+  /**
+   * Reenvía un mensaje entrante de WhatsApp al backend de Laravel
+   * (POST /api/whatsapp/inbound) para que el estudio contable pueda ver el
+   * historial de conversaciones de sus clientes. Incluye adjuntos en base64.
+   *
+   * Config por env:
+   *   LARAVEL_URL           ej. http://127.0.0.1:8005  (sin barra final)
+   *   WA_INBOUND_API_KEY    (o CV_IMPORT_API_KEY como fallback)
+   *
+   * Si LARAVEL_URL no está seteada, no hace nada (no rompe el bot).
+   */
+  private async forwardToLaravel(message: Message): Promise<void> {
+    const laravelUrl = (process.env.LARAVEL_URL || '').replace(/\/+$/, '');
+    if (!laravelUrl) {
+      return;
+    }
+    const apiKey =
+      process.env.WA_INBOUND_API_KEY || process.env.CV_IMPORT_API_KEY || '';
+
+    // Mapear tipo de whatsapp-web.js al que espera Laravel.
+    const rawType = (message.type as string) || 'chat';
+    const tipoMap: Record<string, string> = {
+      chat: 'text',
+      ptt: 'audio',
+      vcard: 'contact',
+      multi_vcard: 'contact',
+    };
+    const tipo = tipoMap[rawType] || rawType;
+
+    // Descargar adjunto (si hay) y mandarlo en base64. Se omiten archivos
+    // demasiado grandes para no saturar el request.
+    const media: Array<{ mime: string; filename?: string; base64: string }> =
+      [];
+    try {
+      if (message.hasMedia) {
+        const m = await this.downloadMediaCustom(message);
+        if (m && m.data) {
+          const approxBytes = (m.data.length * 3) / 4;
+          if (approxBytes <= 18 * 1024 * 1024) {
+            media.push({
+              mime: m.mimetype,
+              filename: m.filename || undefined,
+              base64: m.data,
+            });
+          } else {
+            console.warn(
+              `⚠️ Adjunto muy grande (${Math.round(approxBytes / 1024 / 1024)}MB), no se reenvía a Laravel`,
+            );
+          }
+        }
+      }
+    } catch (e) {
+      console.error(
+        '⚠️ No se pudo descargar el adjunto para Laravel:',
+        (e as any)?.message || e,
+      );
+    }
+
+    const payload = {
+      jid: message.from,
+      nombre_wa: (message as any)?._data?.notifyName || undefined,
+      wa_uid: message.id?._serialized,
+      direction: 'in',
+      tipo,
+      texto: message.body || null,
+      is_group: message.from.includes('@g.us'),
+      wa_timestamp: message.timestamp, // unix segundos
+      media,
+    };
+
+    await axios.post(`${laravelUrl}/api/whatsapp/inbound`, payload, {
+      headers: { 'X-API-KEY': apiKey, 'Content-Type': 'application/json' },
+      timeout: 20000,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+    });
+  }
+
+  /**
+   * Reenvía a Laravel el ack (estado de entrega/lectura) de un mensaje saliente
+   * para que el estudio vea ✓ / ✓✓ / ✓✓ azul. Sólo aplica a mensajes propios.
+   */
+  private async forwardAckToLaravel(
+    message: Message,
+    ack: number,
+  ): Promise<void> {
+    if (!message?.fromMe) {
+      return; // sólo nos importan los acks de lo que enviamos nosotros
+    }
+    const laravelUrl = (process.env.LARAVEL_URL || '').replace(/\/+$/, '');
+    if (!laravelUrl) {
+      return;
+    }
+    const waUid = message.id?._serialized;
+    if (!waUid) {
+      return;
+    }
+    const apiKey =
+      process.env.WA_INBOUND_API_KEY || process.env.CV_IMPORT_API_KEY || '';
+
+    await axios.post(
+      `${laravelUrl}/api/whatsapp/ack`,
+      { wa_uid: waUid, ack },
+      {
+        headers: { 'X-API-KEY': apiKey, 'Content-Type': 'application/json' },
+        timeout: 10000,
+      },
+    );
+  }
+
   private async saveMessage(message: Message, content: string) {
     const messageData = {
       questionText: content,
@@ -972,6 +1109,91 @@ export class WwebjsService implements OnModuleInit {
       console.error('❌ Error enviando imagen:', error);
       throw new Error('Error enviando imagen: ' + error.message);
     }
+  }
+
+  /**
+   * Envío saliente desde el estudio contable (Laravel) hacia CUALQUIER cliente.
+   * A diferencia de sendImage(), NO aplica isAuthorizedChatId: el estudio puede
+   * responder a cualquier número. Soporta texto y/o adjuntos (base64).
+   * Devuelve los id serializados de los mensajes enviados.
+   */
+  async sendOutbound(params: {
+    to: string;
+    text?: string;
+    media?: Array<{ mime: string; filename?: string; base64: string }>;
+  }): Promise<{ ok: boolean; ids: string[]; status: string }> {
+    if (!this.isConnectionReady()) {
+      throw new Error('WhatsApp no conectado');
+    }
+
+    const chatId = this.normalizeChatId(params.to);
+    const text = (params.text || '').trim();
+    const media = Array.isArray(params.media) ? params.media : [];
+    const ids: string[] = [];
+
+    if (media.length > 0) {
+      for (let i = 0; i < media.length; i++) {
+        const m = media[i];
+        if (!m || !m.base64) continue;
+        const data = m.base64.includes(',')
+          ? m.base64.split(',')[1]
+          : m.base64;
+        const mm = new MessageMedia(
+          m.mime || 'application/octet-stream',
+          data,
+          m.filename || undefined,
+        );
+        // El caption (texto) va sólo en el primer adjunto.
+        const sent = await this.client.sendMessage(chatId, mm, {
+          caption: i === 0 ? text : '',
+          sendSeen: false,
+        });
+        if (sent?.id?._serialized) ids.push(sent.id._serialized);
+      }
+    } else {
+      if (!text) {
+        throw new Error('Mensaje vacío');
+      }
+      const sent = await this.client.sendMessage(chatId, text, {
+        sendSeen: false,
+      });
+      if (sent?.id?._serialized) ids.push(sent.id._serialized);
+    }
+
+    console.log(`✅ Mensaje saliente enviado a ${chatId} (${ids.length} parte/s)`);
+    return { ok: true, ids, status: 'sent' };
+  }
+
+  private normalizeChatId(to: string): string {
+    if (!to) throw new Error('Destinatario vacío');
+    if (to.includes('@')) return to;
+    const digits = to.replace(/\D/g, '');
+    if (!digits) throw new Error('Destinatario inválido');
+    return `${digits}@c.us`;
+  }
+
+  /**
+   * Resuelve un número telefónico al chatId canónico de WhatsApp usando la API
+   * de WhatsApp (getNumberId). Sirve para iniciar conversaciones desde el
+   * estudio (Laravel) hacia un cliente que todavía no escribió, evitando
+   * contactos duplicados cuando el cliente responda.
+   * Devuelve exists=false si el número no está registrado en WhatsApp.
+   */
+  async resolveNumber(
+    number: string,
+  ): Promise<{ ok: boolean; exists: boolean; jid: string | null }> {
+    if (!this.isConnectionReady()) {
+      throw new Error('WhatsApp no conectado');
+    }
+    const digits = (number || '').replace(/\D/g, '');
+    if (!digits) {
+      throw new Error('Número vacío');
+    }
+    const id = await this.client.getNumberId(digits);
+    if (!id?._serialized) {
+      return { ok: true, exists: false, jid: null };
+    }
+    return { ok: true, exists: true, jid: id._serialized };
   }
 
   private parseBase64Image(input: string): { mime: string; data: string } {

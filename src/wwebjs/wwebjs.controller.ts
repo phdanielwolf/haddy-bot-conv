@@ -6,8 +6,10 @@ import {
   Param,
   Query,
   Header,
+  Headers,
   HttpCode,
   HttpStatus,
+  HttpException,
 } from '@nestjs/common';
 import { WwebjsService } from './wwebjs.service';
 import { MessageVDto } from '../venom/messagev.dto';
@@ -57,6 +59,58 @@ export class WwebjsController {
   @HttpCode(HttpStatus.CREATED)
   async sendImage(@Body() dto: SendImageDto): Promise<string> {
     return this.wwebjsService.sendImage(dto);
+  }
+
+  // 📤 Envío saliente desde el estudio (Laravel) hacia un cliente.
+  // Body: { to, text?, media?: [{ mime, filename, base64 }] }
+  // Auth opcional: header X-API-KEY = WA_INBOUND_API_KEY (o CV_IMPORT_API_KEY).
+  @Post('send')
+  @HttpCode(HttpStatus.CREATED)
+  async send(
+    @Body()
+    body: {
+      to: string;
+      text?: string;
+      media?: Array<{ mime: string; filename?: string; base64: string }>;
+    },
+    @Headers('x-api-key') apiKey?: string,
+  ): Promise<{ ok: boolean; ids: string[]; status: string }> {
+    const expected =
+      process.env.WA_INBOUND_API_KEY || process.env.CV_IMPORT_API_KEY || '';
+    if (expected && apiKey !== expected) {
+      throw new HttpException('Unauthorized', HttpStatus.UNAUTHORIZED);
+    }
+    try {
+      return await this.wwebjsService.sendOutbound(body);
+    } catch (e) {
+      throw new HttpException(
+        (e as any)?.message || 'No se pudo enviar el mensaje',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+  }
+
+  // 🔎 Resolver un número al chatId canónico de WhatsApp (para iniciar chats).
+  // Body: { number }  → { ok, exists, jid }
+  @Post('resolve')
+  @HttpCode(HttpStatus.OK)
+  async resolve(
+    @Body() body: { number: string },
+    @Headers('x-api-key') apiKey?: string,
+  ): Promise<{ ok: boolean; exists: boolean; jid: string | null }> {
+    const expected =
+      process.env.WA_INBOUND_API_KEY || process.env.CV_IMPORT_API_KEY || '';
+    if (expected && apiKey !== expected) {
+      throw new HttpException('Unauthorized', HttpStatus.UNAUTHORIZED);
+    }
+    try {
+      return await this.wwebjsService.resolveNumber(body?.number);
+    } catch (e) {
+      throw new HttpException(
+        (e as any)?.message || 'No se pudo resolver el número',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
   }
 
   @Post('disconnect')
