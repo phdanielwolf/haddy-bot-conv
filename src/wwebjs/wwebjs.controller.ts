@@ -91,13 +91,18 @@ export class WwebjsController {
   }
 
   // 🔎 Resolver un número al chatId canónico de WhatsApp (para iniciar chats).
-  // Body: { number }  → { ok, exists, jid }
+  // Body: { number }  → { ok, exists, jid: {numero}@c.us, number }
   @Post('resolve')
   @HttpCode(HttpStatus.OK)
   async resolve(
     @Body() body: { number: string },
     @Headers('x-api-key') apiKey?: string,
-  ): Promise<{ ok: boolean; exists: boolean; jid: string | null }> {
+  ): Promise<{
+    ok: boolean;
+    exists: boolean;
+    jid: string | null;
+    number: string | null;
+  }> {
     const expected =
       process.env.WA_INBOUND_API_KEY || process.env.CV_IMPORT_API_KEY || '';
     if (expected && apiKey !== expected) {

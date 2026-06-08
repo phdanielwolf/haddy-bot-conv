@@ -1202,11 +1202,23 @@ export class WwebjsService implements OnModuleInit {
    * de WhatsApp (getNumberId). Sirve para iniciar conversaciones desde el
    * estudio (Laravel) hacia un cliente que todavía no escribió, evitando
    * contactos duplicados cuando el cliente responda.
+   *
+   * ⚠️ En WhatsApp nuevo, getNumberId puede devolver un LID (`...@lid`) en vez
+   * del `@c.us`. Para que el contacto sea EL MISMO que cuando el cliente escribe
+   * (que entra como `{numero}@c.us`), resolvemos el número real del contacto y
+   * devolvemos siempre un jid `{numero}@c.us`. El LID queda sólo como último
+   * recurso si no se pudo obtener el número.
+   *
    * Devuelve exists=false si el número no está registrado en WhatsApp.
    */
   async resolveNumber(
     number: string,
-  ): Promise<{ ok: boolean; exists: boolean; jid: string | null }> {
+  ): Promise<{
+    ok: boolean;
+    exists: boolean;
+    jid: string | null;
+    number: string | null;
+  }> {
     if (!this.isConnectionReady()) {
       throw new Error('WhatsApp no conectado');
     }
@@ -1214,11 +1226,29 @@ export class WwebjsService implements OnModuleInit {
     if (!digits) {
       throw new Error('Número vacío');
     }
-    const id = await this.client.getNumberId(digits);
+    const id: any = await this.client.getNumberId(digits);
     if (!id?._serialized) {
-      return { ok: true, exists: false, jid: null };
+      return { ok: true, exists: false, jid: null, number: null };
     }
-    return { ok: true, exists: true, jid: id._serialized };
+
+    // Obtener el número real (convierte LID → teléfono) vía el contacto.
+    let realNumber = '';
+    try {
+      const contact: any = await this.client.getContactById(id._serialized);
+      realNumber = (contact?.number || '').toString().replace(/\D/g, '');
+    } catch (e) {
+      console.warn(
+        '⚠️ No se pudo resolver el contacto al iniciar chat:',
+        (e as any)?.message || e,
+      );
+    }
+    // Si el id NO es un LID y trae el número en `user`, usarlo como respaldo.
+    if (!realNumber && id.user && !String(id._serialized).includes('@lid')) {
+      realNumber = String(id.user).replace(/\D/g, '');
+    }
+
+    const jid = realNumber ? `${realNumber}@c.us` : id._serialized;
+    return { ok: true, exists: true, jid, number: realNumber || null };
   }
 
   private parseBase64Image(input: string): { mime: string; data: string } {
