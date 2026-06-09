@@ -359,15 +359,10 @@ export class WwebjsService implements OnModuleInit {
 
       // 🔁 Reenviar SIEMPRE el mensaje a Laravel (independiente del filtro del
       // bot) para que el estudio contable vea lo que escriben TODOS los
-      // clientes. Fire-and-forget: no bloquea ni rompe el flujo del bot.
-      if (!message.from.includes('@g.us')) {
-        this.forwardToLaravel(message).catch((e) =>
-          console.error(
-            '⚠️ Error reenviando mensaje a Laravel:',
-            e?.message || e,
-          ),
-        );
-      }
+      // clientes Y los grupos. Fire-and-forget: no bloquea ni rompe el flujo.
+      this.forwardToLaravel(message).catch((e) =>
+        console.error('⚠️ Error reenviando mensaje a Laravel:', e?.message || e),
+      );
 
       if (!this.isAuthorizedChatId(message.from)) {
         return;
@@ -927,6 +922,25 @@ export class WwebjsService implements OnModuleInit {
 
     // Mapear tipo de whatsapp-web.js al que espera Laravel.
     const rawType = (message.type as string) || 'chat';
+
+    // Ignorar mensajes de SISTEMA / notificaciones (no son mensajes reales).
+    // Ej: creación/cambios de grupo (gp2), notificaciones e2e, logs de llamada.
+    // Si no, en grupos aparece una "burbuja" vacía cuyo autor es el propio grupo.
+    const SYSTEM_TYPES = new Set([
+      'gp2',
+      'group_notification',
+      'notification',
+      'notification_template',
+      'e2e_notification',
+      'call_log',
+      'protocol',
+      'revoked',
+      'ciphertext',
+    ]);
+    if (SYSTEM_TYPES.has(rawType)) {
+      return;
+    }
+
     const tipoMap: Record<string, string> = {
       chat: 'text',
       ptt: 'audio',
@@ -964,28 +978,87 @@ export class WwebjsService implements OnModuleInit {
       );
     }
 
-    // Resolver el número REAL del remitente. WhatsApp ahora puede entregar el
-    // remitente como un LID (@lid) en lugar del número (@c.us). whatsapp-web.js
-    // mapea LID→teléfono, así que `contact.number` devuelve el número real aunque
-    // `message.from` sea un @lid. Preferimos un jid canónico `{numero}@c.us` para
-    // que Laravel matchee con el cliente y no se dupliquen contactos; el LID
-    // queda SÓLO como último recurso si no se pudo obtener el número.
+    const isGroup = message.from.includes('@g.us');
+
     let jid = message.from;
-    let telefono = (message.from.split('@')[0] || '').replace(/\D/g, '');
-    let nombreWa = (message as any)?._data?.notifyName || undefined;
-    try {
-      const contact: any = await message.getContact();
-      const realNumber = (contact?.number || '').toString().replace(/\D/g, '');
-      if (realNumber) {
-        telefono = realNumber;
-        jid = `${realNumber}@c.us`;
+    let telefono = '';
+    let nombreWa: string | undefined;
+    let authorJid: string | null = null;
+    let authorName: string | null = null;
+
+    if (isGroup) {
+      // Grupo: no se matchea con un cliente. Hay que distinguir bien dos cosas:
+      //  - el NOMBRE DEL GRUPO (chat.name / groupMetadata.subject) → nombre_wa
+      //  - el AUTOR (participante message.author) → author_name
+      // No usar message.getContact() para el autor: en grupos a veces devuelve
+      // el propio grupo y termina mostrando el nombre del grupo como "autor".
+      jid = message.from;
+      authorJid = ((message as any).author || '').toString() || null;
+
+      // Nombre del grupo, con fallbacks.
+      try {
+        const chat: any = await message.getChat();
+        nombreWa = chat?.name || chat?.groupMetadata?.subject || undefined;
+      } catch {
+        /* sin chat */
       }
-      nombreWa = contact?.pushname || contact?.name || nombreWa;
-    } catch (e) {
-      console.warn(
-        '⚠️ No se pudo resolver el contacto (LID→teléfono):',
-        (e as any)?.message || e,
-      );
+      if (!nombreWa) {
+        try {
+          const chat2: any = await this.client.getChatById(message.from);
+          nombreWa = chat2?.name || chat2?.groupMetadata?.subject || undefined;
+        } catch {
+          /* sin chat por id */
+        }
+      }
+      if (!nombreWa) {
+        // El grupo, como "contacto", expone su nombre/subject.
+        try {
+          const gc: any = await this.client.getContactById(message.from);
+          nombreWa = gc?.name || gc?.pushname || undefined;
+        } catch {
+          /* sin nombre de grupo */
+        }
+      }
+
+      // Nombre del autor (participante), resuelto explícitamente por su jid.
+      if (authorJid) {
+        try {
+          const ac: any = await this.client.getContactById(authorJid);
+          authorName =
+            ac?.pushname ||
+            ac?.name ||
+            (ac?.number ? `+${ac.number}` : null);
+        } catch {
+          /* sin contacto del autor */
+        }
+      }
+      if (!authorName) {
+        try {
+          const c: any = await message.getContact();
+          authorName = c?.pushname || c?.name || null;
+        } catch {
+          /* sin autor */
+        }
+      }
+    } else {
+      // Individual: resolver el número REAL (LID → teléfono) y armar el jid
+      // canónico `{numero}@c.us` para matchear con el cliente sin duplicar.
+      telefono = (message.from.split('@')[0] || '').replace(/\D/g, '');
+      nombreWa = (message as any)?._data?.notifyName || undefined;
+      try {
+        const contact: any = await message.getContact();
+        const realNumber = (contact?.number || '').toString().replace(/\D/g, '');
+        if (realNumber) {
+          telefono = realNumber;
+          jid = `${realNumber}@c.us`;
+        }
+        nombreWa = contact?.pushname || contact?.name || nombreWa;
+      } catch (e) {
+        console.warn(
+          '⚠️ No se pudo resolver el contacto (LID→teléfono):',
+          (e as any)?.message || e,
+        );
+      }
     }
 
     const payload = {
@@ -996,7 +1069,9 @@ export class WwebjsService implements OnModuleInit {
       direction: 'in',
       tipo,
       texto: message.body || null,
-      is_group: message.from.includes('@g.us'),
+      is_group: isGroup,
+      author_jid: authorJid,
+      author_name: authorName,
       wa_timestamp: message.timestamp, // unix segundos
       media,
     };
