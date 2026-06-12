@@ -901,6 +901,88 @@ export class WwebjsService implements OnModuleInit {
     return sinAcentos.replace(/[^a-zA-Z0-9_-]/g, '_');
   }
 
+  // ── Reintentos de envío a Laravel ──────────────────────────────────────────
+  // El servidor Laravel queda inaccesible a ráfagas (ETIMEDOUT en horario pico);
+  // sin reintentos se pierden mensajes entrantes y acks. Esperas: 30s → 2min → 10min.
+  private static readonly LARAVEL_RETRY_DELAYS_MS = [30_000, 120_000, 600_000];
+  // Tope de reintentos en espera simultáneos: acota la memoria si Laravel está
+  // caído un rato largo (los payloads con media pueden pesar varios MB).
+  private static readonly LARAVEL_RETRY_MAX_PENDING = 100;
+  private laravelRetriesEnEspera = 0;
+
+  /**
+   * POST a Laravel con reintentos ante errores de red / HTTP 5xx.
+   * Los 4xx NO se reintentan (auth/validación: reintentar no ayuda).
+   * Nunca lanza: loguea el resultado y termina (fire-and-forget).
+   * Es seguro reintentar: /inbound es idempotente por wa_uid y /ack no degrada.
+   */
+  private async postLaravelConReintentos(
+    path: string,
+    payload: any,
+    etiqueta: string,
+    timeoutMs: number,
+  ): Promise<void> {
+    const laravelUrl = (process.env.LARAVEL_URL || '').replace(/\/+$/, '');
+    if (!laravelUrl) {
+      return;
+    }
+    const apiKey =
+      process.env.WA_INBOUND_API_KEY || process.env.CV_IMPORT_API_KEY || '';
+
+    const delays = WwebjsService.LARAVEL_RETRY_DELAYS_MS;
+    const maxIntentos = delays.length + 1;
+
+    for (let intento = 1; intento <= maxIntentos; intento++) {
+      try {
+        await axios.post(`${laravelUrl}${path}`, payload, {
+          headers: { 'X-API-KEY': apiKey, 'Content-Type': 'application/json' },
+          timeout: timeoutMs,
+          maxBodyLength: Infinity,
+          maxContentLength: Infinity,
+        });
+        if (intento > 1) {
+          console.log(
+            `✅ ${etiqueta}: entregado a Laravel en el reintento ${intento}/${maxIntentos}`,
+          );
+        }
+        return;
+      } catch (e) {
+        const status = (e as any)?.response?.status;
+        const motivo = status
+          ? `HTTP ${status}`
+          : (e as any)?.code || (e as any)?.message || 'error de red';
+        const esRetryable = !status || status >= 500;
+
+        if (!esRetryable || intento === maxIntentos) {
+          console.error(
+            `❌ ${etiqueta}: falló definitivamente (intento ${intento}/${maxIntentos}, ${motivo})`,
+          );
+          return;
+        }
+        if (
+          this.laravelRetriesEnEspera >=
+          WwebjsService.LARAVEL_RETRY_MAX_PENDING
+        ) {
+          console.error(
+            `❌ ${etiqueta}: demasiados reintentos en cola (${this.laravelRetriesEnEspera}), se descarta (${motivo})`,
+          );
+          return;
+        }
+
+        const delay = delays[intento - 1];
+        console.warn(
+          `⚠️ ${etiqueta}: ${motivo} — reintentando en ${Math.round(delay / 1000)}s (intento ${intento}/${maxIntentos})`,
+        );
+        this.laravelRetriesEnEspera++;
+        try {
+          await new Promise((r) => setTimeout(r, delay));
+        } finally {
+          this.laravelRetriesEnEspera--;
+        }
+      }
+    }
+  }
+
   /**
    * Reenvía un mensaje entrante de WhatsApp al backend de Laravel
    * (POST /api/whatsapp/inbound) para que el estudio contable pueda ver el
@@ -917,8 +999,6 @@ export class WwebjsService implements OnModuleInit {
     if (!laravelUrl) {
       return;
     }
-    const apiKey =
-      process.env.WA_INBOUND_API_KEY || process.env.CV_IMPORT_API_KEY || '';
 
     // Mapear tipo de whatsapp-web.js al que espera Laravel.
     const rawType = (message.type as string) || 'chat';
@@ -1076,12 +1156,12 @@ export class WwebjsService implements OnModuleInit {
       media,
     };
 
-    await axios.post(`${laravelUrl}/api/whatsapp/inbound`, payload, {
-      headers: { 'X-API-KEY': apiKey, 'Content-Type': 'application/json' },
-      timeout: 20000,
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity,
-    });
+    await this.postLaravelConReintentos(
+      '/api/whatsapp/inbound',
+      payload,
+      `mensaje entrante (${payload.wa_uid || jid})`,
+      20000,
+    );
   }
 
   /**
@@ -1103,16 +1183,12 @@ export class WwebjsService implements OnModuleInit {
     if (!waUid) {
       return;
     }
-    const apiKey =
-      process.env.WA_INBOUND_API_KEY || process.env.CV_IMPORT_API_KEY || '';
 
-    await axios.post(
-      `${laravelUrl}/api/whatsapp/ack`,
+    await this.postLaravelConReintentos(
+      '/api/whatsapp/ack',
       { wa_uid: waUid, ack },
-      {
-        headers: { 'X-API-KEY': apiKey, 'Content-Type': 'application/json' },
-        timeout: 10000,
-      },
+      `ack ${ack} (${waUid})`,
+      10000,
     );
   }
 
