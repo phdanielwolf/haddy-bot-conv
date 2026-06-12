@@ -918,7 +918,7 @@ export class WwebjsService implements OnModuleInit {
    */
   private async postLaravelConReintentos(
     path: string,
-    payload: any,
+    buildPayload: () => any | Promise<any>,
     etiqueta: string,
     timeoutMs: number,
   ): Promise<void> {
@@ -934,6 +934,11 @@ export class WwebjsService implements OnModuleInit {
 
     for (let intento = 1; intento <= maxIntentos; intento++) {
       try {
+        // El payload se re-arma en CADA intento. Clave para WhatsApp: la primera
+        // vez el contacto puede venir como LID (número aún no sincronizado); al
+        // reintentar (30s+ después) ya suele resolver el número real, evitando
+        // que en Laravel aparezca un contacto duplicado con el @lid.
+        const payload = await buildPayload();
         await axios.post(`${laravelUrl}${path}`, payload, {
           headers: { 'X-API-KEY': apiKey, 'Content-Type': 'application/json' },
           timeout: timeoutMs,
@@ -1059,107 +1064,109 @@ export class WwebjsService implements OnModuleInit {
     }
 
     const isGroup = message.from.includes('@g.us');
+    const waUid = message.id?._serialized;
 
-    let jid = message.from;
-    let telefono = '';
-    let nombreWa: string | undefined;
-    let authorJid: string | null = null;
-    let authorName: string | null = null;
+    // El payload se re-arma en cada intento del reintento (re-resuelve el número
+    // LID→teléfono): si la 1ª vez vino como LID, el reintento posterior ya trae
+    // el número real y no se duplica el contacto en Laravel. La media se descargó
+    // una sola vez (arriba) y se reutiliza.
+    const buildPayload = async () => {
+      let jid = message.from;
+      let telefono = '';
+      let nombreWa: string | undefined;
+      let authorJid: string | null = null;
+      let authorName: string | null = null;
 
-    if (isGroup) {
-      // Grupo: no se matchea con un cliente. Hay que distinguir bien dos cosas:
-      //  - el NOMBRE DEL GRUPO (chat.name / groupMetadata.subject) → nombre_wa
-      //  - el AUTOR (participante message.author) → author_name
-      // No usar message.getContact() para el autor: en grupos a veces devuelve
-      // el propio grupo y termina mostrando el nombre del grupo como "autor".
-      jid = message.from;
-      authorJid = ((message as any).author || '').toString() || null;
+      if (isGroup) {
+        // Grupo: distinguir NOMBRE DEL GRUPO (→ nombre_wa) del AUTOR del mensaje
+        // (participante → author_name). No usar getContact() para el autor: en
+        // grupos a veces devuelve el propio grupo.
+        jid = message.from;
+        authorJid = ((message as any).author || '').toString() || null;
 
-      // Nombre del grupo, con fallbacks.
-      try {
-        const chat: any = await message.getChat();
-        nombreWa = chat?.name || chat?.groupMetadata?.subject || undefined;
-      } catch {
-        /* sin chat */
-      }
-      if (!nombreWa) {
         try {
-          const chat2: any = await this.client.getChatById(message.from);
-          nombreWa = chat2?.name || chat2?.groupMetadata?.subject || undefined;
+          const chat: any = await message.getChat();
+          nombreWa = chat?.name || chat?.groupMetadata?.subject || undefined;
         } catch {
-          /* sin chat por id */
+          /* sin chat */
         }
-      }
-      if (!nombreWa) {
-        // El grupo, como "contacto", expone su nombre/subject.
+        if (!nombreWa) {
+          try {
+            const chat2: any = await this.client.getChatById(message.from);
+            nombreWa = chat2?.name || chat2?.groupMetadata?.subject || undefined;
+          } catch {
+            /* sin chat por id */
+          }
+        }
+        if (!nombreWa) {
+          try {
+            const gc: any = await this.client.getContactById(message.from);
+            nombreWa = gc?.name || gc?.pushname || undefined;
+          } catch {
+            /* sin nombre de grupo */
+          }
+        }
+
+        if (authorJid) {
+          try {
+            const ac: any = await this.client.getContactById(authorJid);
+            authorName =
+              ac?.pushname || ac?.name || (ac?.number ? `+${ac.number}` : null);
+          } catch {
+            /* sin contacto del autor */
+          }
+        }
+        if (!authorName) {
+          try {
+            const c: any = await message.getContact();
+            authorName = c?.pushname || c?.name || null;
+          } catch {
+            /* sin autor */
+          }
+        }
+      } else {
+        // Individual: resolver el número REAL (LID → teléfono) y armar el jid
+        // canónico `{numero}@c.us` para matchear con el cliente sin duplicar.
+        telefono = (message.from.split('@')[0] || '').replace(/\D/g, '');
+        nombreWa = (message as any)?._data?.notifyName || undefined;
         try {
-          const gc: any = await this.client.getContactById(message.from);
-          nombreWa = gc?.name || gc?.pushname || undefined;
-        } catch {
-          /* sin nombre de grupo */
+          const contact: any = await message.getContact();
+          const realNumber = (contact?.number || '')
+            .toString()
+            .replace(/\D/g, '');
+          if (realNumber) {
+            telefono = realNumber;
+            jid = `${realNumber}@c.us`;
+          }
+          nombreWa = contact?.pushname || contact?.name || nombreWa;
+        } catch (e) {
+          console.warn(
+            '⚠️ No se pudo resolver el contacto (LID→teléfono):',
+            (e as any)?.message || e,
+          );
         }
       }
 
-      // Nombre del autor (participante), resuelto explícitamente por su jid.
-      if (authorJid) {
-        try {
-          const ac: any = await this.client.getContactById(authorJid);
-          authorName =
-            ac?.pushname ||
-            ac?.name ||
-            (ac?.number ? `+${ac.number}` : null);
-        } catch {
-          /* sin contacto del autor */
-        }
-      }
-      if (!authorName) {
-        try {
-          const c: any = await message.getContact();
-          authorName = c?.pushname || c?.name || null;
-        } catch {
-          /* sin autor */
-        }
-      }
-    } else {
-      // Individual: resolver el número REAL (LID → teléfono) y armar el jid
-      // canónico `{numero}@c.us` para matchear con el cliente sin duplicar.
-      telefono = (message.from.split('@')[0] || '').replace(/\D/g, '');
-      nombreWa = (message as any)?._data?.notifyName || undefined;
-      try {
-        const contact: any = await message.getContact();
-        const realNumber = (contact?.number || '').toString().replace(/\D/g, '');
-        if (realNumber) {
-          telefono = realNumber;
-          jid = `${realNumber}@c.us`;
-        }
-        nombreWa = contact?.pushname || contact?.name || nombreWa;
-      } catch (e) {
-        console.warn(
-          '⚠️ No se pudo resolver el contacto (LID→teléfono):',
-          (e as any)?.message || e,
-        );
-      }
-    }
-
-    const payload = {
-      jid,
-      telefono,
-      nombre_wa: nombreWa,
-      wa_uid: message.id?._serialized,
-      direction: 'in',
-      tipo,
-      texto: message.body || null,
-      is_group: isGroup,
-      author_jid: authorJid,
-      author_name: authorName,
-      wa_timestamp: message.timestamp, // unix segundos
-      media,
+      return {
+        jid,
+        telefono,
+        nombre_wa: nombreWa,
+        wa_uid: waUid,
+        direction: 'in',
+        tipo,
+        texto: message.body || null,
+        is_group: isGroup,
+        author_jid: authorJid,
+        author_name: authorName,
+        wa_timestamp: message.timestamp, // unix segundos
+        media,
+      };
     };
 
     await this.postLaravelConReintentos(
       '/api/whatsapp/inbound',
-      payload,
-      `mensaje entrante (${payload.wa_uid || jid})`,
+      buildPayload,
+      `mensaje entrante (${waUid || message.from})`,
       20000,
     );
   }
@@ -1186,7 +1193,7 @@ export class WwebjsService implements OnModuleInit {
 
     await this.postLaravelConReintentos(
       '/api/whatsapp/ack',
-      { wa_uid: waUid, ack },
+      () => ({ wa_uid: waUid, ack }),
       `ack ${ack} (${waUid})`,
       10000,
     );
