@@ -50,7 +50,7 @@ export class WwebjsService implements OnModuleInit {
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private lastHeartbeat = 0;
   private heartbeatFailures = 0;
-  private maxHeartbeatFailures = 3;
+  private maxHeartbeatFailures = 4; // ~2 min de tolerancia antes de reinicializar
   private readonly allowedResponderNumber = '5493835404743';
 
   constructor(
@@ -155,8 +155,14 @@ export class WwebjsService implements OnModuleInit {
       // Inicializar cliente
       await this.client.initialize();
     } catch (error) {
-      console.error('❌ Error en initializeWWebJS:', error);
-      this.scheduleReconnect(5000);
+      console.error(
+        '❌ Error en initializeWWebJS:',
+        (error as any)?.message || error,
+      );
+      // Liberar el flag y reagendar con backoff (no martillar cada 5s, que
+      // puede empeorar el throttling de la IP por parte de WhatsApp).
+      this.isReconnecting = false;
+      this.handleReconnection('TIMEOUT');
     }
   }
 
@@ -273,18 +279,20 @@ export class WwebjsService implements OnModuleInit {
   private handleDisconnection(reason: string) {
     this.stopHeartbeat();
 
-    if (this.reconnectAttempts < this.maxReconnectAttempts) {
-      const delay = this.calculateReconnectDelay(reason);
-      console.log(
-        `⏳ Intento de reconexión ${this.reconnectAttempts + 1}/${this.maxReconnectAttempts} en ${delay / 1000} segundos...`,
+    // Reintentar SIEMPRE, sin tope: el bot se auto-recupera de cortes de red
+    // prolongados (ej. WhatsApp limita la IP del datacenter, o bache de red en
+    // Railway) sin necesidad de reinicio/redeploy manual. El backoff de
+    // calculateReconnectDelay evita martillar los servidores.
+    if (this.reconnectAttempts + 1 >= this.maxReconnectAttempts) {
+      console.warn(
+        `⚠️ Reconexión: ${this.reconnectAttempts + 1} intentos seguidos (motivo: ${reason}). Sigo reintentando…`,
       );
-      this.handleReconnection(reason);
     } else {
-      console.log('❌ Máximo número de intentos de reconexión alcanzado');
-      this.clearMessageQueue(
-        'Máximo número de intentos de reconexión alcanzado',
+      console.log(
+        `⏳ Reconexión programada (motivo: ${reason}, intento ${this.reconnectAttempts + 1})…`,
       );
     }
+    this.handleReconnection(reason);
   }
 
   private handleReconnection(reason: string) {
@@ -303,7 +311,7 @@ export class WwebjsService implements OnModuleInit {
   private calculateReconnectDelay(reason: string): number {
     const baseDelay = Math.min(
       1000 * Math.pow(2, this.reconnectAttempts - 1),
-      30000,
+      60000, // tope 60s entre intentos durante cortes prolongados
     );
 
     switch (reason) {
@@ -342,10 +350,13 @@ export class WwebjsService implements OnModuleInit {
         }
         await this.initializeWWebJS();
       } catch (error) {
-        console.error('❌ Error durante la reconexión:', error);
-        if (this.reconnectAttempts < this.maxReconnectAttempts) {
-          this.scheduleReconnect(5000);
-        }
+        console.error(
+          '❌ Error durante la reconexión:',
+          (error as any)?.message || error,
+        );
+        // Reagendar siempre con backoff (auto-recuperación, sin tope).
+        this.isReconnecting = false;
+        this.handleReconnection('TIMEOUT');
       }
     }, delay);
   }
