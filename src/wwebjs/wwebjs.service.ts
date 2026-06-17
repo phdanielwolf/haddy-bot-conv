@@ -24,6 +24,7 @@ import { DropboxService } from 'src/dropbox/dropbox.service';
 import { OpenAiService } from 'src/ia/openai.service';
 import { remove as removeAccents } from 'diacritics';
 import axios from 'axios';
+import * as nodemailer from 'nodemailer';
 
 interface QueuedMessage {
   messageDto: MessageVDto;
@@ -53,6 +54,13 @@ export class WwebjsService implements OnModuleInit {
   private maxHeartbeatFailures = 4; // ~2 min de tolerancia antes de reinicializar
   private readonly allowedResponderNumber = '5493835404743';
 
+  // ── Monitor de salud (alerta por email si el bot no puede enviar/recibir) ──
+  private healthCheckTimer: NodeJS.Timeout | null = null;
+  private healthFirstCheckTimer: NodeJS.Timeout | null = null;
+  private healthLastStatus: 'ok' | 'down' | 'unknown' = 'unknown';
+  private healthDownSince = 0;
+  private healthLastAlertAt = 0;
+
   constructor(
     private readonly botService: BotSynergysService,
     private readonly questionsService: QuestionsService,
@@ -67,6 +75,7 @@ export class WwebjsService implements OnModuleInit {
   async onModuleInit() {
     try {
       console.log('🚀 Inicializando cliente de WhatsApp Web.js...');
+      this.startHealthMonitor(); // chequeo periódico + alerta por email
       await this.initializeWWebJS();
     } catch (error) {
       console.error('❌ Error inicializando WhatsApp Web.js:', error);
@@ -1564,6 +1573,163 @@ export class WwebjsService implements OnModuleInit {
     this.messageQueue = [];
   }
 
+  // ── Monitor de salud + alerta por email ────────────────────────────────────
+  // Cada N minutos (HEALTH_CHECK_INTERVAL_MIN, default 30) verifica que el bot
+  // esté realmente operativo (conectado + estable + heartbeat vivo = puede
+  // enviar/recibir). Si NO lo está, manda un email de alerta. No spamea: avisa
+  // al caer, re-avisa cada HEALTH_REALERT_HOURS (default 3) mientras siga caído,
+  // y manda un email de "recuperado" cuando vuelve.
+  //
+  // Config por env:
+  //   ALERT_EMAIL_TO            destino(s), separados por coma. SIN esto, el monitor NO corre.
+  //   HEALTH_CHECK_INTERVAL_MIN intervalo de chequeo (default 30)
+  //   HEALTH_REALERT_HOURS      cada cuántas horas re-avisar si sigue caído (default 3)
+  //   SMTP_HOST / SMTP_PORT / SMTP_SECURE / SMTP_USER / SMTP_PASS / SMTP_FROM
+  private startHealthMonitor() {
+    const to = (process.env.ALERT_EMAIL_TO || '').trim();
+    if (!to) {
+      console.log(
+        'ℹ️ Monitor de salud deshabilitado (falta ALERT_EMAIL_TO en el .env).',
+      );
+      return;
+    }
+    const intervalMin = Number(process.env.HEALTH_CHECK_INTERVAL_MIN) || 30;
+    const intervalMs = Math.max(1, intervalMin) * 60 * 1000;
+    console.log(
+      `🩺 Monitor de salud activo: chequeo cada ${intervalMin} min, alertas a ${to}`,
+    );
+
+    // Primer chequeo a los 5 min: detecta fallos de arranque sin esperar todo el intervalo.
+    this.healthFirstCheckTimer = setTimeout(
+      () => this.performHealthCheck().catch(() => {}),
+      5 * 60 * 1000,
+    );
+    this.healthCheckTimer = setInterval(
+      () => this.performHealthCheck().catch(() => {}),
+      intervalMs,
+    );
+  }
+
+  private stopHealthMonitor() {
+    if (this.healthFirstCheckTimer) {
+      clearTimeout(this.healthFirstCheckTimer);
+      this.healthFirstCheckTimer = null;
+    }
+    if (this.healthCheckTimer) {
+      clearInterval(this.healthCheckTimer);
+      this.healthCheckTimer = null;
+    }
+  }
+
+  /** ¿El bot puede enviar/recibir ahora mismo? (conectado + estable + heartbeat vivo) */
+  private async isBotHealthy(): Promise<boolean> {
+    try {
+      if (!this.client || !this.isConnected) return false;
+      if (!this.isConnectionReady()) return false;
+      const state = await this.client.getState();
+      if (state !== 'CONNECTED') return false;
+      // El heartbeat corre cada 30s; si hace >3 min que no late, está colgado.
+      if (this.lastHeartbeat && Date.now() - this.lastHeartbeat > 3 * 60 * 1000) {
+        return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async performHealthCheck(): Promise<void> {
+    const to = (process.env.ALERT_EMAIL_TO || '').trim();
+    if (!to) return;
+
+    const healthy = await this.isBotHealthy();
+    const now = Date.now();
+
+    if (healthy) {
+      if (this.healthLastStatus === 'down') {
+        const downMin = Math.round((now - this.healthDownSince) / 60000);
+        await this.sendAlertEmail(
+          '✅ Bot de WhatsApp RECUPERADO',
+          `El bot volvió a estar operativo (puede enviar/recibir).\n` +
+            `Estuvo caído ~${downMin} min.\n` +
+            `Fecha: ${new Date().toLocaleString('es-AR')}`,
+        );
+      } else {
+        console.log('🩺 Chequeo de salud: OK (conectado y operativo).');
+      }
+      this.healthLastStatus = 'ok';
+      this.healthDownSince = 0;
+      return;
+    }
+
+    // No saludable
+    const reAlertMs =
+      (Number(process.env.HEALTH_REALERT_HOURS) || 3) * 60 * 60 * 1000;
+    const recienCaido = this.healthLastStatus !== 'down';
+    if (recienCaido) {
+      this.healthDownSince = now;
+    }
+
+    if (recienCaido || now - this.healthLastAlertAt >= reAlertMs) {
+      let estado = 'desconocido';
+      try {
+        estado = this.client ? await this.client.getState() : 'sin cliente';
+      } catch {
+        estado = 'sin respuesta';
+      }
+      const downMin = Math.round((now - this.healthDownSince) / 60000);
+      await this.sendAlertEmail(
+        '❌ Bot de WhatsApp CAÍDO',
+        `El bot NO está operativo: no puede enviar/recibir mensajes.\n\n` +
+          `Estado WhatsApp: ${estado}\n` +
+          `Reconectando: ${this.isReconnecting ? 'sí' : 'no'}\n` +
+          `Intentos de reconexión: ${this.reconnectAttempts}\n` +
+          `Caído desde hace: ~${downMin} min\n` +
+          `Fecha: ${new Date().toLocaleString('es-AR')}\n\n` +
+          `El bot sigue reintentando reconectar solo. Si no se recupera, ` +
+          `revisá Railway (red/IP) o re-escaneá el QR.`,
+      );
+      this.healthLastAlertAt = now;
+    }
+    this.healthLastStatus = 'down';
+  }
+
+  private async sendAlertEmail(subject: string, text: string): Promise<void> {
+    const to = (process.env.ALERT_EMAIL_TO || '').trim();
+    const host = (process.env.SMTP_HOST || '').trim();
+    if (!to || !host) {
+      console.warn(
+        `⚠️ Alerta NO enviada (falta SMTP_HOST o ALERT_EMAIL_TO): ${subject}`,
+      );
+      return;
+    }
+    try {
+      const transporter = nodemailer.createTransport({
+        host,
+        port: Number(process.env.SMTP_PORT) || 587,
+        secure: (process.env.SMTP_SECURE || 'false').toLowerCase() === 'true',
+        auth: process.env.SMTP_USER
+          ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+          : undefined,
+      });
+      await transporter.sendMail({
+        from:
+          process.env.SMTP_FROM ||
+          process.env.SMTP_USER ||
+          'haddybot@localhost',
+        to,
+        subject: `[HaddyBot WhatsApp] ${subject}`,
+        text,
+      });
+      console.log(`📧 Alerta enviada: "${subject}" → ${to}`);
+    } catch (e) {
+      console.error(
+        '❌ No se pudo enviar la alerta por email:',
+        (e as any)?.message || e,
+      );
+    }
+  }
+
   // Sistema de Heartbeat
   private startHeartbeat() {
     console.log('💓 Iniciando sistema de heartbeat...');
@@ -1726,6 +1892,7 @@ export class WwebjsService implements OnModuleInit {
     }
 
     this.stopHeartbeat();
+    this.stopHealthMonitor();
     this.clearMessageQueue('Desconexión solicitada');
 
     if (this.client) {
