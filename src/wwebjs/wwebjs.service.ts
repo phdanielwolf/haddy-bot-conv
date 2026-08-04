@@ -1172,6 +1172,10 @@ export class WwebjsService implements OnModuleInit {
 
       return {
         jid,
+        // LID de WhatsApp: si el remitente vino como `...@lid`, se manda aparte
+        // para que Laravel pueda unificar el hilo aunque la resolución
+        // LID→número falle en algún mensaje (evita contactos duplicados).
+        lid: message.from.endsWith('@lid') ? message.from : null,
         telefono,
         nombre_wa: nombreWa,
         wa_uid: waUid,
