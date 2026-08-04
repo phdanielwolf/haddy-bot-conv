@@ -633,7 +633,10 @@ export class WwebjsService implements OnModuleInit {
     try {
       return await message.downloadMedia();
     } catch (error) {
-      console.log('⚠️ Error en downloadMedia nativo:', error.message);
+      console.log(
+        '⚠️ Error en downloadMedia nativo:',
+        error?.stack || error?.message || error,
+      );
 
       // Intento de recuperación si falla el método nativo
       try {
