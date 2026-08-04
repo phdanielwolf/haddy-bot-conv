@@ -1150,16 +1150,19 @@ export class WwebjsService implements OnModuleInit {
       } else {
         // Individual: resolver el número REAL (LID → teléfono) y armar el jid
         // canónico `{numero}@c.us` para matchear con el cliente sin duplicar.
-        telefono = (message.from.split('@')[0] || '').replace(/\D/g, '');
+        const fromDigits = (message.from.split('@')[0] || '').replace(/\D/g, '');
+        const esLid = message.from.endsWith('@lid');
+        telefono = fromDigits;
         nombreWa = (message as any)?._data?.notifyName || undefined;
+
+        let realNumber = '';
         try {
           const contact: any = await message.getContact();
-          const realNumber = (contact?.number || '')
-            .toString()
-            .replace(/\D/g, '');
-          if (realNumber) {
-            telefono = realNumber;
-            jid = `${realNumber}@c.us`;
+          const n = (contact?.number || '').toString().replace(/\D/g, '');
+          // OJO: con el WA Web nuevo, contact.number puede devolver los dígitos
+          // del LID (NO es un teléfono). Sólo lo aceptamos si difiere de ellos.
+          if (n && !(esLid && n === fromDigits)) {
+            realNumber = n;
           }
           nombreWa = contact?.pushname || contact?.name || nombreWa;
         } catch (e) {
@@ -1167,6 +1170,39 @@ export class WwebjsService implements OnModuleInit {
             '⚠️ No se pudo resolver el contacto (LID→teléfono):',
             (e as any)?.message || e,
           );
+        }
+
+        // Resolución dura LID→número contra el store de WA (helper del fork).
+        if (!realNumber && esLid) {
+          try {
+            const res: any = await (this.client as any).pupPage.evaluate(
+              async (uid: string) => {
+                // @ts-ignore
+                const r = await window.WWebJS.enforceLidAndPnRetrieval(uid);
+                return r?.phone ? { user: r.phone.user } : null;
+              },
+              message.from,
+            );
+            const n2 = ((res?.user || '') as string).replace(/\D/g, '');
+            if (n2 && n2 !== fromDigits) {
+              realNumber = n2;
+              console.log(`🔁 LID resuelto vía store: ${message.from} → ${n2}`);
+            }
+          } catch (e) {
+            console.warn(
+              '⚠️ enforceLidAndPnRetrieval falló:',
+              (e as any)?.message || e,
+            );
+          }
+        }
+
+        if (realNumber) {
+          telefono = realNumber;
+          jid = `${realNumber}@c.us`;
+        } else if (esLid) {
+          // Sin número real conocido: NO inventar un teléfono con los dígitos
+          // del LID; el jid queda @lid y Laravel lo maneja como pendiente.
+          telefono = '';
         }
       }
 
