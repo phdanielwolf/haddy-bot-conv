@@ -1087,7 +1087,7 @@ export class WwebjsService implements OnModuleInit {
     }
 
     const isGroup = message.from.includes('@g.us');
-    const waUid = message.id?._serialized;
+    const waUid = this.serializeWaId(message.id);
 
     // El payload se re-arma en cada intento del reintento (re-resuelve el número
     // LID→teléfono): si la 1ª vez vino como LID, el reintento posterior ya trae
@@ -1238,6 +1238,39 @@ export class WwebjsService implements OnModuleInit {
    * Reenvía a Laravel el ack (estado de entrega/lectura) de un mensaje saliente
    * para que el estudio vea ✓ / ✓✓ / ✓✓ azul. Sólo aplica a mensajes propios.
    */
+  /**
+   * Serializa un id de WhatsApp de forma robusta. Con WA Web 2.3000.1043+ la
+   * propiedad `_serialized` puede venir renombrada como `$1` (código minificado)
+   * o directamente ausente; sin esto los salientes quedaban sin wa_uid en
+   * Laravel y los acks (✓✓) nunca matcheaban.
+   */
+  private serializeWaId(id: any): string | null {
+    if (!id) return null;
+    if (typeof id === 'string') return id || null;
+    if (typeof id._serialized === 'string' && id._serialized) {
+      return id._serialized;
+    }
+    if (typeof id.$1 === 'string' && id.$1) {
+      return id.$1;
+    }
+    // Reconstrucción manual: {fromMe}_{remote}_{id}
+    try {
+      const remote =
+        (typeof id.remote === 'string' ? id.remote : null) ||
+        id.remote?._serialized ||
+        id.remote?.$1 ||
+        (id.remote?.user && id.remote?.server
+          ? `${id.remote.user}@${id.remote.server}`
+          : null);
+      if (id.id && remote) {
+        return `${id.fromMe ? 'true' : 'false'}_${remote}_${id.id}`;
+      }
+    } catch {
+      /* sin reconstrucción */
+    }
+    return null;
+  }
+
   private async forwardAckToLaravel(
     message: Message,
     ack: number,
@@ -1249,7 +1282,7 @@ export class WwebjsService implements OnModuleInit {
     if (!laravelUrl) {
       return;
     }
-    const waUid = message.id?._serialized;
+    const waUid = this.serializeWaId(message.id);
     if (!waUid) {
       return;
     }
@@ -1394,7 +1427,8 @@ export class WwebjsService implements OnModuleInit {
           caption: i === 0 ? text : '',
           sendSeen: false,
         });
-        if (sent?.id?._serialized) ids.push(sent.id._serialized);
+        const sid = this.serializeWaId(sent?.id);
+        if (sid) ids.push(sid);
       }
     } else {
       if (!text) {
@@ -1403,7 +1437,8 @@ export class WwebjsService implements OnModuleInit {
       const sent = await this.client.sendMessage(chatId, text, {
         sendSeen: false,
       });
-      if (sent?.id?._serialized) ids.push(sent.id._serialized);
+      const sid = this.serializeWaId(sent?.id);
+      if (sid) ids.push(sid);
     }
 
     console.log(`✅ Mensaje saliente enviado a ${chatId} (${ids.length} parte/s)`);
@@ -1448,14 +1483,15 @@ export class WwebjsService implements OnModuleInit {
       throw new Error('Número vacío');
     }
     const id: any = await this.client.getNumberId(digits);
-    if (!id?._serialized) {
+    const idSerialized = this.serializeWaId(id);
+    if (!idSerialized) {
       return { ok: true, exists: false, jid: null, number: null };
     }
 
     // Obtener el número real (convierte LID → teléfono) vía el contacto.
     let realNumber = '';
     try {
-      const contact: any = await this.client.getContactById(id._serialized);
+      const contact: any = await this.client.getContactById(idSerialized);
       realNumber = (contact?.number || '').toString().replace(/\D/g, '');
     } catch (e) {
       console.warn(
@@ -1464,11 +1500,11 @@ export class WwebjsService implements OnModuleInit {
       );
     }
     // Si el id NO es un LID y trae el número en `user`, usarlo como respaldo.
-    if (!realNumber && id.user && !String(id._serialized).includes('@lid')) {
+    if (!realNumber && id.user && !idSerialized.includes('@lid')) {
       realNumber = String(id.user).replace(/\D/g, '');
     }
 
-    const jid = realNumber ? `${realNumber}@c.us` : id._serialized;
+    const jid = realNumber ? `${realNumber}@c.us` : idSerialized;
     return { ok: true, exists: true, jid, number: realNumber || null };
   }
 
