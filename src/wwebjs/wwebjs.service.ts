@@ -1441,8 +1441,61 @@ export class WwebjsService implements OnModuleInit {
       if (sid) ids.push(sid);
     }
 
+    // Último recurso: si sendMessage no devolvió el mensaje (WA 1043 rompió la
+    // serialización del MsgKey en el retorno), rescatar el id del último
+    // mensaje propio del chat para que Laravel guarde el wa_uid y los acks
+    // (✓✓) puedan matchear.
+    if (ids.length === 0) {
+      const rescatado = await this.fetchUltimoIdSaliente(chatId);
+      if (rescatado) {
+        ids.push(rescatado);
+        console.log(`🛟 Id saliente rescatado del chat: ${rescatado}`);
+      }
+    }
+
     console.log(`✅ Mensaje saliente enviado a ${chatId} (${ids.length} parte/s)`);
     return { ok: true, ids, status: 'sent' };
+  }
+
+  /**
+   * Busca en el chat el último mensaje propio y devuelve su id serializado.
+   * Fallback para cuando client.sendMessage() devuelve undefined (WA Web
+   * 2.3000.1043+ renombró `_serialized` y la librería pierde el retorno).
+   */
+  private async fetchUltimoIdSaliente(chatId: string): Promise<string | null> {
+    try {
+      const res: any = await (this.client as any).pupPage.evaluate(
+        async (cid: string) => {
+          try {
+            // @ts-ignore
+            const chat = await window.WWebJS.getChat(cid, { getAsModel: false });
+            if (!chat) return null;
+            const msgs = chat.msgs?.getModelsArray?.() || [];
+            for (let i = msgs.length - 1; i >= 0; i--) {
+              const m = msgs[i];
+              const id = m?.id || (m as any)?.__x_id;
+              if (!id || !id.fromMe) continue;
+              return (
+                id._serialized ||
+                id.$1 ||
+                (typeof id.toString === 'function' ? id.toString() : null)
+              );
+            }
+            return null;
+          } catch {
+            return null;
+          }
+        },
+        chatId,
+      );
+      return typeof res === 'string' && res ? res : null;
+    } catch (e) {
+      console.warn(
+        '⚠️ No se pudo rescatar el id del saliente:',
+        (e as any)?.message || e,
+      );
+      return null;
+    }
   }
 
   private normalizeChatId(to: string): string {

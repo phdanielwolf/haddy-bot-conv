@@ -6,6 +6,7 @@
   "private": true,
   "license": "UNLICENSED",
   "scripts": {
+    "postinstall": "patch-package",
     "build": "nest build",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
@@ -44,6 +45,7 @@
     "openai": "^5.5.1",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
+    "patch-package": "^8.0.1",
     "pdfkit": "^0.17.2",
     "pg": "^8.16.0",
     "qrcode": "^1.5.4",

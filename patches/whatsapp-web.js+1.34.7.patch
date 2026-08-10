@@ -1,0 +1,24 @@
+diff --git a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+index d1380d3..90176d2 100644
+--- a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
++++ b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+@@ -625,9 +625,18 @@ exports.LoadUtils = () => {
+ 
+         if (options.waitUntilMsgSent) await sendMsgResultPromise;
+ 
++        // WA Web 2.3000.1043+: `_serialized` puede venir renombrado ($1) en la
++        // clase minificada de MsgKey; sin el fallback Msg.get(undefined) devuelve
++        // nada y el caller pierde el id del mensaje enviado (rompe los acks).
++        const newMsgKeySer =
++            newMsgKey._serialized ||
++            newMsgKey.$1 ||
++            (typeof newMsgKey.toString === 'function'
++                ? newMsgKey.toString()
++                : null);
+         return window
+             .require('WAWebCollections')
+-            .Msg.get(newMsgKey._serialized);
++            .Msg.get(newMsgKeySer);
+     };
+ 
+     window.WWebJS.editMessage = async (msg, content, options = {}) => {
