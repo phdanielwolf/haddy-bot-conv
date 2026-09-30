@@ -154,8 +154,49 @@ export class WhatsappQrController {
   )
   @Header('Pragma', 'no-cache')
   @Header('Expires', '0')
-  getQr(): { status: string; qr: string | null } {
+  getQr() {
     return this.wwebjsService.getQr();
+  }
+
+  // 🔍 Qué mostraba el Chrome del bot la última vez que falló la conexión
+  // (captura + URL + texto). Protegido con la misma API key que /baileys/send:
+  // /whatsapp/debug-view?key=XXX
+  @Get('debug-view')
+  @Header('Content-Type', 'text/html; charset=utf-8')
+  @Header('Cache-Control', 'no-store')
+  debugView(
+    @Query('key') key?: string,
+    @Headers('x-api-key') apiKey?: string,
+  ): string {
+    const expected =
+      process.env.WA_INBOUND_API_KEY || process.env.CV_IMPORT_API_KEY || '';
+    if (expected && key !== expected && apiKey !== expected) {
+      throw new HttpException('Unauthorized', HttpStatus.UNAUTHORIZED);
+    }
+    const e = this.wwebjsService.getLastInitError();
+    const esc = (v: string | null | undefined) =>
+      String(v ?? '').replace(
+        /[&<>"]/g,
+        (c) =>
+          ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c] || c,
+      );
+    const cuerpo = !e
+      ? '<p>No hubo fallos de conexión desde el último arranque.</p>'
+      : `<table cellpadding="4">
+          <tr><td><b>Fecha</b></td><td>${esc(e.at)}</td></tr>
+          <tr><td><b>Error</b></td><td>${esc(e.message)}</td></tr>
+          <tr><td><b>URL</b></td><td>${esc(e.url)}</td></tr>
+          <tr><td><b>Título</b></td><td>${esc(e.title)}</td></tr>
+          ${e.captureError ? `<tr><td><b>Captura</b></td><td>${esc(e.captureError)}</td></tr>` : ''}
+        </table>
+        <h3>Texto de la página</h3>
+        <pre style="white-space:pre-wrap;background:#f4f4f4;padding:8px">${esc(e.text)}</pre>
+        ${e.screenshot ? `<h3>Captura</h3><img src="${e.screenshot}" style="max-width:100%;border:1px solid #ccc" />` : ''}`;
+    return `<!doctype html><html lang="es"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WhatsApp bot - diagnóstico</title></head>
+<body style="font-family: system-ui, Arial; padding: 16px;">
+<h1>Último fallo de conexión</h1>${cuerpo}</body></html>`;
   }
 
   @Get('qr-view')
@@ -195,6 +236,14 @@ export class WhatsappQrController {
           const data = await res.json();
           statusEl.textContent = data.status || 'unknown';
 
+          if (data.qrAgeSeconds !== undefined) {
+            statusEl.textContent += ' (QR generado hace ' + data.qrAgeSeconds + ' s)';
+          }
+          if (data.lastError) {
+            statusEl.textContent += ' — último error: ' + data.lastError.message +
+              ' (' + new Date(data.lastError.at).toLocaleTimeString('es-AR') + ')';
+          }
+
           if (data.qr) {
             let img = document.getElementById('qrimg');
             if (!img) {
@@ -203,7 +252,9 @@ export class WhatsappQrController {
             }
             img.src = data.qr;
           } else {
-            container.innerHTML = '<div id="noqr">No hay un QR disponible en este momento.</div>';
+            container.innerHTML = data.status === 'qr_expirado'
+              ? '<div id="noqr">El QR anterior venció y el bot se está reconectando. Esperá a que aparezca uno nuevo.</div>'
+              : '<div id="noqr">No hay un QR disponible en este momento.</div>';
           }
         } catch (e) {
           statusEl.textContent = 'error';

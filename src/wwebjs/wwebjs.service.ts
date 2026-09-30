@@ -46,6 +46,28 @@ export class WwebjsService implements OnModuleInit {
   private reconnectTimeout: NodeJS.Timeout | null = null;
   private messageQueue: QueuedMessage[] = [];
   private isReconnecting = false;
+  // Evita dos inicializaciones en paralelo: antes un mensaje encolado o un
+  // reintento programado destruía el Chrome que estaba a mitad de carga y el
+  // bot entraba en un loop de "auth timeout" sin llegar nunca a conectar.
+  private isInitializing = false;
+  private initStartedAt = 0;
+  private readonly initStaleMs = 3 * 60 * 1000;
+  // Cada cliente creado lleva un número de generación; los eventos de un
+  // cliente viejo (ya reemplazado) se ignoran.
+  private clientGeneration = 0;
+  // Un QR de WhatsApp se renueva cada ~20 s: si el guardado es más viejo que
+  // esto, es de un intento anterior y ya no sirve para escanear.
+  private readonly qrMaxAgeMs = 90 * 1000;
+  // Diagnóstico del último fallo de inicialización (captura + texto de la página).
+  private lastInitError: {
+    at: string;
+    message: string;
+    url: string | null;
+    title: string | null;
+    text: string | null;
+    screenshot: string | null;
+    captureError?: string;
+  } | null = null;
   private lastConnectionTime = 0;
   private connectionStableTime = 5000; // 5 segundos para considerar conexión estable
   private heartbeatInterval: NodeJS.Timeout | null = null;
@@ -112,6 +134,22 @@ export class WwebjsService implements OnModuleInit {
   }
 
   private async initializeWWebJS() {
+    if (
+      this.isInitializing &&
+      Date.now() - this.initStartedAt < this.initStaleMs
+    ) {
+      console.log('⏳ Ya hay una inicialización en curso, no se lanza otra.');
+      return;
+    }
+    this.isInitializing = true;
+    this.initStartedAt = Date.now();
+    const generation = ++this.clientGeneration;
+    // El QR de un intento anterior ya no sirve: se descarta al arrancar.
+    this.currentQr = null;
+    this.currentQrUpdatedAt = 0;
+    this.connectionState = 'INITIALIZING';
+    let client: Client | null = null;
+
     try {
       // Crear directorio para sesión si no existe.
       // Configurable por env: en producción/Railway = '/data/wwebjs_auth'
@@ -125,7 +163,7 @@ export class WwebjsService implements OnModuleInit {
       this.cleanChromeLocks(sessionDir);
 
       // Configurar cliente con opciones optimizadas
-      this.client = new Client({
+      client = new Client({
         authStrategy: new (require('whatsapp-web.js').LocalAuth)({
           dataPath: sessionDir,
         }),
@@ -149,34 +187,116 @@ export class WwebjsService implements OnModuleInit {
             '--disable-background-timer-throttling',
             '--disable-backgrounding-occluded-windows',
             '--disable-renderer-backgrounding',
-            // Usar un User-Agent moderno para evitar bloqueos
-            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
           ],
         },
+        // ⚠️ La librería hace page.setUserAgent(options.userAgent) y su default
+        // es un Chrome 101 de 2022 (pisaba el '--user-agent' que se pasaba en
+        // args). WhatsApp Web puede no cargar con un navegador tan viejo →
+        // "auth timeout". Se usa uno acorde al Chrome real (146, puppeteer 24.38).
+        userAgent:
+          process.env.WWEBJS_USER_AGENT ||
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+        // Tiempo máximo para que cargue WhatsApp Web (default de la librería:
+        // 30 s, corto para Railway cuando el contenedor está cargado).
+        authTimeoutMs: Number(process.env.WWEBJS_AUTH_TIMEOUT_MS) || 90000,
         qrMaxRetries: 0,
         takeoverOnConflict: true,
         takeoverTimeoutMs: 30000,
       });
+      this.client = client;
 
       // Configurar eventos
-      this.setupEventHandlers();
+      this.setupEventHandlers(client, generation);
 
       // Inicializar cliente
-      await this.client.initialize();
+      await client.initialize();
     } catch (error) {
-      console.error(
-        '❌ Error en initializeWWebJS:',
-        (error as any)?.message || error,
-      );
-      // Liberar el flag y reagendar con backoff (no martillar cada 5s, que
+      const msg = String((error as any)?.message || error);
+      if (generation !== this.clientGeneration) {
+        // Este cliente ya fue reemplazado por otro (reconexión forzada, etc.):
+        // su error no debe disparar otra reconexión.
+        console.log(`ℹ️ Inicialización anterior descartada (${msg}).`);
+        return;
+      }
+      console.error('❌ Error en initializeWWebJS:', msg);
+      await this.captureInitFailure(client, msg);
+      this.currentQr = null;
+      this.currentQrUpdatedAt = 0;
+      this.isConnected = false;
+      this.connectionState = 'DISCONNECTED';
+      // Liberar los flags y reagendar con backoff (no martillar cada 5s, que
       // puede empeorar el throttling de la IP por parte de WhatsApp).
+      this.isInitializing = false;
       this.isReconnecting = false;
       this.handleReconnection('TIMEOUT');
+    } finally {
+      if (generation === this.clientGeneration) {
+        this.isInitializing = false;
+      }
     }
   }
 
-  private setupEventHandlers() {
-    this.client.on('qr', async (qr) => {
+  /**
+   * Guarda qué estaba mostrando el Chrome del bot cuando falló la
+   * inicialización (URL, título, texto y captura). Se ve en
+   * GET /whatsapp/debug-view y un resumen queda en el log.
+   */
+  private async captureInitFailure(client: Client | null, message: string) {
+    const info: NonNullable<WwebjsService['lastInitError']> = {
+      at: new Date().toISOString(),
+      message,
+      url: null,
+      title: null,
+      text: null,
+      screenshot: null,
+    };
+    const conTope = <T>(p: Promise<T>, ms: number): Promise<T> =>
+      Promise.race([
+        p,
+        new Promise<T>((_, rej) =>
+          setTimeout(() => rej(new Error('timeout capturando')), ms),
+        ),
+      ]);
+    try {
+      const page = (client as any)?.pupPage;
+      if (page && !page.isClosed()) {
+        info.url = page.url();
+        info.title = await conTope(page.title(), 5000);
+        info.text = await conTope(
+          page.evaluate(() =>
+            (document.body?.innerText || '').slice(0, 2000),
+          ) as Promise<string>,
+          5000,
+        );
+        const shot = await conTope(
+          page.screenshot({ type: 'jpeg', quality: 60, encoding: 'base64' }),
+          10000,
+        );
+        info.screenshot = `data:image/jpeg;base64,${shot}`;
+      } else {
+        info.captureError = 'El navegador no llegó a abrir la página';
+      }
+    } catch (e) {
+      info.captureError = String((e as any)?.message || e);
+    }
+    this.lastInitError = info;
+    console.error(
+      `🔍 Diagnóstico del fallo: url=${info.url} | título=${info.title} | ` +
+        `texto="${(info.text || '').replace(/\s+/g, ' ').slice(0, 300)}"` +
+        (info.captureError ? ` | captura: ${info.captureError}` : ''),
+    );
+  }
+
+  getLastInitError() {
+    return this.lastInitError;
+  }
+
+  private setupEventHandlers(client: Client, generation: number) {
+    // Los eventos de un cliente ya reemplazado se ignoran.
+    const vigente = () => generation === this.clientGeneration;
+
+    client.on('qr', async (qr) => {
+      if (!vigente()) return;
       try {
         this.currentQr = await QRCode.toDataURL(qr, {
           width: 512,
@@ -184,6 +304,7 @@ export class WwebjsService implements OnModuleInit {
           errorCorrectionLevel: 'M',
         });
         this.currentQrUpdatedAt = Date.now();
+        this.connectionState = 'QR';
         console.log('📱 Código QR generado (base64 en memoria)');
       } catch (error) {
         console.error('❌ Error generando QR base64:', error);
@@ -191,12 +312,14 @@ export class WwebjsService implements OnModuleInit {
     });
 
     // Evento de carga de pantalla
-    this.client.on('loading_screen', (percent, message) => {
+    client.on('loading_screen', (percent, message) => {
+      if (!vigente()) return;
       console.log('⏳ Cargando WhatsApp Web:', percent, '%', message);
     });
 
     // Evento de cliente listo
-    this.client.on('ready', () => {
+    client.on('ready', () => {
+      if (!vigente()) return;
       console.log('✅ Cliente WhatsApp Web.js conectado exitosamente!');
       this.isConnected = true;
       this.connectionState = 'CONNECTED';
@@ -205,6 +328,7 @@ export class WwebjsService implements OnModuleInit {
       this.lastConnectionTime = Date.now();
       this.reconnectAttempts = 0;
       this.isReconnecting = false;
+      this.lastInitError = null;
 
       if (this.reconnectTimeout) {
         clearTimeout(this.reconnectTimeout);
@@ -216,27 +340,25 @@ export class WwebjsService implements OnModuleInit {
     });
 
     // Evento de autenticación exitosa
-    this.client.on('authenticated', () => {
+    client.on('authenticated', () => {
+      if (!vigente()) return;
       console.log('🔐 Cliente autenticado correctamente');
+      this.currentQr = null;
+      this.currentQrUpdatedAt = 0;
 
       // Watchdog: Si no llega a READY en 60 segundos, reiniciar
       setTimeout(async () => {
-        if (!this.isConnected) {
-          console.error(
-            '🚨 ALERTA: El cliente se quedó pegado en "Authenticated" sin llegar a "Ready". Forzando reinicio...',
-          );
-          try {
-            await this.client.destroy();
-          } catch (e) {
-            console.error('Error destruyendo cliente:', e);
-          }
-          this.initializeWWebJS();
-        }
+        if (!vigente() || this.isConnected) return;
+        console.error(
+          '🚨 ALERTA: El cliente se quedó pegado en "Authenticated" sin llegar a "Ready". Forzando reinicio...',
+        );
+        await this.restartClient();
       }, 60000);
     });
 
     // Evento de fallo de autenticación
-    this.client.on('auth_failure', (msg) => {
+    client.on('auth_failure', (msg) => {
+      if (!vigente()) return;
       console.error('❌ Fallo de autenticación:', msg);
       this.currentQr = null;
       this.currentQrUpdatedAt = 0;
@@ -244,7 +366,8 @@ export class WwebjsService implements OnModuleInit {
     });
 
     // Evento de desconexión
-    this.client.on('disconnected', (reason) => {
+    client.on('disconnected', (reason) => {
+      if (!vigente()) return;
       console.log('🔌 Cliente desconectado:', reason);
       this.isConnected = false;
       this.connectionState = 'DISCONNECTED';
@@ -254,35 +377,86 @@ export class WwebjsService implements OnModuleInit {
     });
 
     // Evento de mensajes
-    this.client.on('message_create', async (message) => {
+    client.on('message_create', async (message) => {
       await this.handleIncomingMessage(message);
     });
 
     // 📡 Acks de entrega/lectura de los mensajes que ENVIAMOS (salientes).
     // ack: -1 error, 0 pending, 1 server(✓), 2 device(✓✓), 3 read(✓✓ azul), 4 played.
-    this.client.on('message_ack', (message, ack) => {
+    client.on('message_ack', (message, ack) => {
       this.forwardAckToLaravel(message, ack).catch((e) =>
         console.error('⚠️ Error reenviando ack a Laravel:', e?.message || e),
       );
     });
 
     // Evento de cambio de estado
-    this.client.on('change_state', (state) => {
+    client.on('change_state', (state) => {
+      if (!vigente()) return;
       console.log('🔄 Cambio de estado:', state);
       this.connectionState = state;
     });
   }
 
-  getQr(): { status: string; qr: string | null } {
+  getQr(): {
+    status: string;
+    qr: string | null;
+    qrAgeSeconds?: number;
+    lastError?: { at: string; message: string } | null;
+  } {
+    const lastError = this.lastInitError
+      ? { at: this.lastInitError.at, message: this.lastInitError.message }
+      : null;
+
     if (this.currentQr) {
-      return { status: 'ready', qr: this.currentQr };
+      const age = Date.now() - this.currentQrUpdatedAt;
+      if (age <= this.qrMaxAgeMs) {
+        return {
+          status: 'ready',
+          qr: this.currentQr,
+          qrAgeSeconds: Math.round(age / 1000),
+        };
+      }
+      // QR vencido: WhatsApp dejó de renovarlo (la página se colgó o se está
+      // reconectando). No se muestra para no hacer escanear un código muerto.
+      return { status: 'qr_expirado', qr: null, lastError };
     }
 
     if (this.isConnected) {
       return { status: 'connected', qr: null };
     }
 
-    return { status: this.connectionState || 'disconnected', qr: null };
+    return {
+      status: this.connectionState || 'disconnected',
+      qr: null,
+      lastError,
+    };
+  }
+
+  /** Destruye el cliente actual (aunque esté a mitad de carga) y arranca uno nuevo. */
+  private async restartClient() {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+    this.stopHeartbeat();
+    this.isConnected = false;
+    this.connectionState = 'DISCONNECTED';
+    this.currentQr = null;
+    this.currentQrUpdatedAt = 0;
+    // Invalida el cliente vigente: su error de "sesión cerrada" al destruirlo
+    // no debe disparar otra reconexión.
+    this.clientGeneration++;
+    const viejo = this.client;
+    if (viejo) {
+      try {
+        await viejo.destroy();
+      } catch (e) {
+        console.error('⚠️ Error destruyendo cliente:', (e as any)?.message || e);
+      }
+    }
+    this.isInitializing = false;
+    this.isReconnecting = true;
+    await this.initializeWWebJS();
   }
 
   private handleDisconnection(reason: string) {
@@ -348,9 +522,24 @@ export class WwebjsService implements OnModuleInit {
     }
 
     this.reconnectTimeout = setTimeout(async () => {
+      this.reconnectTimeout = null;
       try {
+        if (
+          this.isInitializing &&
+          Date.now() - this.initStartedAt < this.initStaleMs
+        ) {
+          // Hay un Chrome cargando WhatsApp Web: NO se lo mata. Si falla, su
+          // propio catch vuelve a programar la reconexión.
+          console.log(
+            '⏳ Reconexión omitida: ya hay una inicialización en curso.',
+          );
+          this.isReconnecting = false;
+          return;
+        }
         console.log('🔄 Iniciando reconexión...');
         if (this.client) {
+          // Invalida el cliente viejo antes de destruirlo (sus eventos ya no cuentan).
+          this.clientGeneration++;
           try {
             await this.client.destroy();
           } catch (e) {
@@ -1641,7 +1830,15 @@ export class WwebjsService implements OnModuleInit {
         `📥 Mensaje agregado a la cola (${this.messageQueue.length} mensajes pendientes)`,
       );
 
-      if (!this.isReconnecting && !this.isConnected) {
+      // Sólo si el bot está realmente caído y sin nada en marcha: si está
+      // cargando o mostrando el QR, reconectar mataría ese intento (y el QR).
+      if (
+        !this.isReconnecting &&
+        !this.isInitializing &&
+        !this.isConnected &&
+        !this.reconnectTimeout &&
+        this.connectionState === 'DISCONNECTED'
+      ) {
         console.log('🔄 Iniciando reconexión debido a mensaje en cola...');
         this.handleReconnection('QUEUE_TRIGGER');
       }
@@ -1980,6 +2177,15 @@ export class WwebjsService implements OnModuleInit {
       connectionState: this.connectionState,
       clientState: clientState,
       isReconnecting: this.isReconnecting,
+      isInitializing: this.isInitializing,
+      lastInitError: this.lastInitError
+        ? {
+            at: this.lastInitError.at,
+            message: this.lastInitError.message,
+            url: this.lastInitError.url,
+            title: this.lastInitError.title,
+          }
+        : null,
       reconnectAttempts: this.reconnectAttempts,
       maxReconnectAttempts: this.maxReconnectAttempts,
       connectionAge: connectionAge,
@@ -1995,24 +2201,8 @@ export class WwebjsService implements OnModuleInit {
 
   async forceReconnect(): Promise<void> {
     console.log('🔄 Forzando reconexión...');
-
-    if (this.reconnectTimeout) {
-      clearTimeout(this.reconnectTimeout);
-      this.reconnectTimeout = null;
-    }
-
-    this.isConnected = false;
-    this.connectionState = 'DISCONNECTED';
-    this.isReconnecting = false;
     this.reconnectAttempts = 0;
-
-    try {
-      await this.client.destroy();
-    } catch (error) {
-      console.error('❌ Error destruyendo cliente:', error);
-    }
-
-    await this.initializeWWebJS();
+    await this.restartClient();
   }
 
   async disconnect() {
