@@ -29,6 +29,9 @@ WORKDIR /app
 
 # Copiar archivos de dependencias
 COPY package*.json ./
+# Los parches de librerías (patch-package) tienen que estar ANTES de `npm ci`: el hook postinstall los aplica ahí.
+# Sin esto, en Railway el parche de whatsapp-web.js NO se aplicaba (patches/ llegaba recién con el `COPY . .`).
+COPY patches ./patches
 
 # Instalar dependencias
 # Nota: Si tienes problemas con 'canvas' o 'sharp', es posible que necesites instalar dependencias del sistema adicionales.

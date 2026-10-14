@@ -2,7 +2,19 @@ diff --git a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js b/node_modu
 index d1380d3..90176d2 100644
 --- a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
 +++ b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
-@@ -625,9 +625,18 @@ exports.LoadUtils = () => {
+@@ -528,6 +528,11 @@
+             ...extraOptions,
+         };
+ 
++        // WA Web 2.3000.1047+ (sep/2026): el spread de mediaOptions.toJSON() deja un `__x_id` en el mensaje y WA Web
++        // revienta al inicializarlo ("Data passed to getter must include an id property (it's how we memoize) but got
++        // undefined") -> no salen imágenes/PDF/audio. Fix comunitario: wwebjs/whatsapp-web.js#201921 (PR #201923).
++        delete message.__x_id;
++
+         // Bot's won't reply if canonicalUrl is set (linking)
+         if (botOptions) {
+             delete message.canonicalUrl;
+@@ -625,9 +630,18 @@
  
          if (options.waitUntilMsgSent) await sendMsgResultPromise;
  
