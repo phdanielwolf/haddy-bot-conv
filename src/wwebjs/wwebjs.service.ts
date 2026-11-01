@@ -1599,17 +1599,22 @@ export class WwebjsService implements OnModuleInit {
     const media = Array.isArray(params.media) ? params.media : [];
     const ids: string[] = [];
 
-    // WA Web nuevo: escribirle por primera vez a un `{numero}@c.us` cuyo LID WhatsApp Web todavía no conoce
-    // tira "No LID for user" (findOrCreateLatestChat). Se le pide el LID a WhatsApp antes de enviar (queda
-    // registrado el mapeo número↔LID); si aun así falla, se reintenta UNA vez enviando directo al `@lid`.
-    const lid = await this.asegurarLid(chatId);
+    // WA Web nuevo: a los contactos que WhatsApp ya pasó a LID no se les puede escribir por `{numero}@c.us`
+    // ("No LID for user", lo tira el propio WhatsApp). En ese caso se busca el LID y se reintenta directo al
+    // `@lid` (por las 3 vías de asegurarLid). Lo que ya andaba (contactos con chat abierto) sigue igual: el LID se
+    // busca sólo si el envío al `@c.us` falla con ese error.
+    const diag: string[] = [];
     try {
       await this.enviarPartes(chatId, text, media, ids);
     } catch (e) {
       const msg = String((e as any)?.message || e);
-      if (!/no lid/i.test(msg) || !lid || lid === chatId) throw e;
-      console.warn(`⚠️ "${msg.slice(0, 60)}" enviando a ${chatId}: reintento por el LID ${lid}`);
-      chatId = lid;
+      if (!/no lid/i.test(msg) || chatId.endsWith('@lid')) throw e;
+      const lid2 = await this.asegurarLid(chatId, diag);
+      if (!lid2) {
+        throw new Error(`WhatsApp no informó el LID de ${chatId} (${diag.join('; ') || 'sin datos'}): ${msg}`);
+      }
+      console.warn(`⚠️ "${msg.slice(0, 60)}" enviando a ${chatId}: reintento por el LID ${lid2}`);
+      chatId = lid2;
       await this.enviarPartes(chatId, text, media, ids);
     }
 
@@ -1630,19 +1635,57 @@ export class WwebjsService implements OnModuleInit {
   }
 
   /**
-   * Pide a WhatsApp el LID de un `{numero}@c.us` (y deja registrado el mapeo número↔LID en WhatsApp Web).
-   * Devuelve el `...@lid` o null (grupos, ids que ya son LID, o si WhatsApp no lo informa). Nunca tira.
+   * Busca el LID de un `{numero}@c.us` por 3 vías (la 1ª que lo dé): (1) getContactLidAndPhone de la librería,
+   * (2) consulta directa a WhatsApp Web (queryWidExists, que en versiones nuevas trae el `lid` en la respuesta,
+   * + mapeo local), (3) getNumberId, que para contactos migrados devuelve el `@lid`. Devuelve el `...@lid` o null
+   * (grupos, ids que ya son LID, o si WhatsApp no lo informa). Anota en `diag` qué dio cada vía. Nunca tira.
    */
-  private async asegurarLid(chatId: string): Promise<string | null> {
+  private async asegurarLid(chatId: string, diag: string[] = []): Promise<string | null> {
     if (!chatId.endsWith('@c.us')) return null;
+    const esLid = (v: any) => (typeof v === 'string' && v.endsWith('@lid') ? v : null);
+
     try {
       const r: any = await (this.client as any).getContactLidAndPhone([chatId]);
-      const lid = Array.isArray(r) ? r[0]?.lid : null;
-      return typeof lid === 'string' && lid.endsWith('@lid') ? lid : null;
+      const lid = esLid(Array.isArray(r) ? r[0]?.lid : null);
+      diag.push(`lidAndPhone=${lid || 'no'}`);
+      if (lid) return lid;
     } catch (e) {
-      console.warn('⚠️ No se pudo obtener el LID de', chatId, (e as any)?.message || e);
-      return null;
+      diag.push(`lidAndPhone=error ${String((e as any)?.message || e).slice(0, 60)}`);
     }
+
+    try {
+      const r: any = await (this.client as any).pupPage.evaluate(async (cid: string) => {
+        const ser = (w: any) => (w ? w._serialized || w.$1 || (typeof w.toString === 'function' ? w.toString() : null) : null);
+        // @ts-ignore
+        const wid = window.require('WAWebWidFactory').createWid(cid);
+        // @ts-ignore
+        const api = window.require('WAWebApiContact');
+        let lid = ser(api.getCurrentLid(wid));
+        if (lid) return { lid, via: 'local' };
+        // @ts-ignore
+        const q: any = await window.require('WAWebQueryExistsJob').queryWidExists(wid);
+        lid = ser(q?.lid) || ser(api.getCurrentLid(wid));
+        if (!lid && q?.wid && q.wid.server === 'lid') lid = ser(q.wid);
+        return { lid, via: 'query', existe: !!q?.wid, claves: q ? Object.keys(q).join(',') : '' };
+      }, chatId);
+      const lid = esLid(r?.lid);
+      diag.push(`query=${lid || 'no'}${r?.claves ? ` [${r.claves}]` : ''}${r?.existe === false ? ' (no existe)' : ''}`);
+      if (lid) return lid;
+    } catch (e) {
+      diag.push(`query=error ${String((e as any)?.message || e).slice(0, 60)}`);
+    }
+
+    try {
+      const id: any = await this.client.getNumberId(chatId.replace('@c.us', ''));
+      const lid = esLid(this.serializeWaId(id));
+      diag.push(`numberId=${this.serializeWaId(id) || 'null'}`);
+      if (lid) return lid;
+    } catch (e) {
+      diag.push(`numberId=error ${String((e as any)?.message || e).slice(0, 60)}`);
+    }
+
+    console.warn(`⚠️ Sin LID para ${chatId}: ${diag.join('; ')}`);
+    return null;
   }
 
   /** Envía el texto o los adjuntos (el caption va en el primero) y agrega los ids que devuelva WhatsApp. */
