@@ -1594,11 +1594,64 @@ export class WwebjsService implements OnModuleInit {
       throw new Error('WhatsApp no conectado');
     }
 
-    const chatId = this.normalizeChatId(params.to);
+    let chatId = this.normalizeChatId(params.to);
     const text = (params.text || '').trim();
     const media = Array.isArray(params.media) ? params.media : [];
     const ids: string[] = [];
 
+    // WA Web nuevo: escribirle por primera vez a un `{numero}@c.us` cuyo LID WhatsApp Web todavía no conoce
+    // tira "No LID for user" (findOrCreateLatestChat). Se le pide el LID a WhatsApp antes de enviar (queda
+    // registrado el mapeo número↔LID); si aun así falla, se reintenta UNA vez enviando directo al `@lid`.
+    const lid = await this.asegurarLid(chatId);
+    try {
+      await this.enviarPartes(chatId, text, media, ids);
+    } catch (e) {
+      const msg = String((e as any)?.message || e);
+      if (!/no lid/i.test(msg) || !lid || lid === chatId) throw e;
+      console.warn(`⚠️ "${msg.slice(0, 60)}" enviando a ${chatId}: reintento por el LID ${lid}`);
+      chatId = lid;
+      await this.enviarPartes(chatId, text, media, ids);
+    }
+
+    // Último recurso: si sendMessage no devolvió el mensaje (WA 1043 rompió la
+    // serialización del MsgKey en el retorno), rescatar el id del último
+    // mensaje propio del chat para que Laravel guarde el wa_uid y los acks
+    // (✓✓) puedan matchear.
+    if (ids.length === 0) {
+      const rescatado = await this.fetchUltimoIdSaliente(chatId);
+      if (rescatado) {
+        ids.push(rescatado);
+        console.log(`🛟 Id saliente rescatado del chat: ${rescatado}`);
+      }
+    }
+
+    console.log(`✅ Mensaje saliente enviado a ${chatId} (${ids.length} parte/s)`);
+    return { ok: true, ids, status: 'sent' };
+  }
+
+  /**
+   * Pide a WhatsApp el LID de un `{numero}@c.us` (y deja registrado el mapeo número↔LID en WhatsApp Web).
+   * Devuelve el `...@lid` o null (grupos, ids que ya son LID, o si WhatsApp no lo informa). Nunca tira.
+   */
+  private async asegurarLid(chatId: string): Promise<string | null> {
+    if (!chatId.endsWith('@c.us')) return null;
+    try {
+      const r: any = await (this.client as any).getContactLidAndPhone([chatId]);
+      const lid = Array.isArray(r) ? r[0]?.lid : null;
+      return typeof lid === 'string' && lid.endsWith('@lid') ? lid : null;
+    } catch (e) {
+      console.warn('⚠️ No se pudo obtener el LID de', chatId, (e as any)?.message || e);
+      return null;
+    }
+  }
+
+  /** Envía el texto o los adjuntos (el caption va en el primero) y agrega los ids que devuelva WhatsApp. */
+  private async enviarPartes(
+    chatId: string,
+    text: string,
+    media: Array<{ mime: string; filename?: string; base64: string }>,
+    ids: string[],
+  ): Promise<void> {
     if (media.length > 0) {
       for (let i = 0; i < media.length; i++) {
         const m = media[i];
@@ -1629,21 +1682,6 @@ export class WwebjsService implements OnModuleInit {
       const sid = this.serializeWaId(sent?.id);
       if (sid) ids.push(sid);
     }
-
-    // Último recurso: si sendMessage no devolvió el mensaje (WA 1043 rompió la
-    // serialización del MsgKey en el retorno), rescatar el id del último
-    // mensaje propio del chat para que Laravel guarde el wa_uid y los acks
-    // (✓✓) puedan matchear.
-    if (ids.length === 0) {
-      const rescatado = await this.fetchUltimoIdSaliente(chatId);
-      if (rescatado) {
-        ids.push(rescatado);
-        console.log(`🛟 Id saliente rescatado del chat: ${rescatado}`);
-      }
-    }
-
-    console.log(`✅ Mensaje saliente enviado a ${chatId} (${ids.length} parte/s)`);
-    return { ok: true, ids, status: 'sent' };
   }
 
   /**
