@@ -75,6 +75,8 @@ export class WwebjsService implements OnModuleInit {
   private heartbeatFailures = 0;
   private maxHeartbeatFailures = 4; // ~2 min de tolerancia antes de reinicializar
   private readonly allowedResponderNumber = '5493835404743';
+  // Teléfono → `...@lid` que informó getNumberId en /baileys/resolve (lo usa sendOutbound para el reintento).
+  private readonly lidPorNumero = new Map<string, string>();
 
   // ── Monitor de salud (alerta por email si el bot no puede enviar/recibir) ──
   private healthCheckTimer: NodeJS.Timeout | null = null;
@@ -1644,6 +1646,12 @@ export class WwebjsService implements OnModuleInit {
     if (!chatId.endsWith('@c.us')) return null;
     const esLid = (v: any) => (typeof v === 'string' && v.endsWith('@lid') ? v : null);
 
+    const cache = this.lidPorNumero.get(chatId.split('@')[0]);
+    if (cache) {
+      diag.push(`cache=${cache}`);
+      return cache;
+    }
+
     try {
       const r: any = await (this.client as any).getContactLidAndPhone([chatId]);
       const lid = esLid(Array.isArray(r) ? r[0]?.lid : null);
@@ -1811,24 +1819,46 @@ export class WwebjsService implements OnModuleInit {
       return { ok: true, exists: false, jid: null, number: null };
     }
 
-    // Obtener el número real (convierte LID → teléfono) vía el contacto.
+    // Obtener el número real (convierte LID → teléfono).
+    // OJO: para un contacto LID, `contact.number` puede devolver los dígitos del LID (no el teléfono): armar
+    // `{lid}@c.us` con eso es un id inexistente y el envío falla con "No LID for user". Por eso se descarta
+    // cualquier "número" igual al LID y, si no hay otro dato, se usan los dígitos que pidió Laravel (que ya
+    // llegan con 549), porque getNumberId confirmó que ese número tiene WhatsApp.
+    const esLid = idSerialized.endsWith('@lid');
+    const lidUser = esLid ? idSerialized.split('@')[0] : '';
+    const valido = (n: string) => !!n && n !== lidUser;
     let realNumber = '';
-    try {
-      const contact: any = await this.client.getContactById(idSerialized);
-      realNumber = (contact?.number || '').toString().replace(/\D/g, '');
-    } catch (e) {
-      console.warn(
-        '⚠️ No se pudo resolver el contacto al iniciar chat:',
-        (e as any)?.message || e,
-      );
+    if (esLid) {
+      try {
+        const r: any = await (this.client as any).getContactLidAndPhone([idSerialized]);
+        const pn = Array.isArray(r) ? String(r[0]?.pn || '') : '';
+        if (pn.endsWith('@c.us')) realNumber = pn.split('@')[0].replace(/\D/g, '');
+      } catch {
+        // sigue con el contacto
+      }
+    }
+    if (!valido(realNumber)) {
+      try {
+        const contact: any = await this.client.getContactById(idSerialized);
+        realNumber = (contact?.number || '').toString().replace(/\D/g, '');
+      } catch (e) {
+        console.warn(
+          '⚠️ No se pudo resolver el contacto al iniciar chat:',
+          (e as any)?.message || e,
+        );
+      }
     }
     // Si el id NO es un LID y trae el número en `user`, usarlo como respaldo.
-    if (!realNumber && id.user && !idSerialized.includes('@lid')) {
+    if (!valido(realNumber) && id.user && !esLid) {
       realNumber = String(id.user).replace(/\D/g, '');
     }
+    if (!valido(realNumber)) realNumber = esLid ? digits : realNumber;
 
-    const jid = realNumber ? `${realNumber}@c.us` : idSerialized;
-    return { ok: true, exists: true, jid, number: realNumber || null };
+    // Se recuerda el LID para el envío: escribirle al `{numero}@c.us` de un contacto LID da "No LID for user".
+    if (esLid && valido(realNumber)) this.lidPorNumero.set(realNumber, idSerialized);
+
+    const jid = valido(realNumber) ? `${realNumber}@c.us` : idSerialized;
+    return { ok: true, exists: true, jid, number: valido(realNumber) ? realNumber : null };
   }
 
   private parseBase64Image(input: string): { mime: string; data: string } {
